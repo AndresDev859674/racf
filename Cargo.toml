@@ -5,7 +5,6 @@ members = ["crates/racf-core", "crates/racf-player", "crates/racf-utils"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"

@@ -3,10 +3,11 @@ name = "racf-player"
 description = "Audio player and DSP engine for RACF files"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file = "../../LICENSE"
 
 [dependencies]
 cpal.workspace = true
+crossterm = "0.28"
 racf-core = { path = "../racf-core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

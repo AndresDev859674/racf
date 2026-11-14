@@ -9,6 +9,7 @@ pub struct PreparedClip {
     /// Interleaved frames at the device sample rate.
     pub samples: Arc<[f32]>,
     pub channels: usize,
+    pub sample_rate: f32,
 }
 
 impl PreparedClip {
@@ -26,11 +27,18 @@ impl PreparedClip {
             id: clip.id.clone(),
             samples: samples.into(),
             channels,
+            sample_rate: device_rate,
         }
     }
 
     pub fn frames(&self) -> usize {
         self.samples.len().checked_div(self.channels).unwrap_or(0)
+    }
+
+    /// Frame index for a playback offset. The result is clamped to the clip.
+    pub fn frame_at(&self, offset_secs: f32) -> usize {
+        let frame = (offset_secs.max(0.0) * self.sample_rate).round() as usize;
+        frame.min(self.frames())
     }
 }
 
@@ -53,6 +61,19 @@ impl SampleVoice {
             pan: pan.clamp(-1.0, 1.0),
             channel,
         }
+    }
+
+    /// Starts a clip at `offset_secs`, used when seeking into a long clip.
+    pub fn new_at(
+        clip: Arc<PreparedClip>,
+        gain: f32,
+        pan: f32,
+        channel: Option<Channel>,
+        offset_secs: f32,
+    ) -> Self {
+        let mut voice = Self::new(clip, gain, pan, channel);
+        voice.frame = voice.clip.frame_at(offset_secs);
+        voice
     }
 
     pub fn is_active(&self) -> bool {
@@ -125,8 +146,12 @@ fn add_mono(
     }
 }
 
-/// Resamples interleaved audio. Upsampling uses linear interpolation;
-/// downsampling uses a short box average to reduce aliasing.
+/// Windowed-sinc (Lanczos) resampling.
+///
+/// Upsampling uses a band-limited interpolator instead of linear interpolation,
+/// and downsampling widens the kernel so content above the new Nyquist limit is
+/// filtered out rather than folded back as aliasing. Weights are normalized,
+/// which also keeps constant signals exactly constant at the edges.
 fn resample(input: &[f32], source_rate: f64, target_rate: f64, channels: usize) -> Vec<f32> {
     if input.is_empty() || channels == 0 || source_rate <= 0.0 || target_rate <= 0.0 {
         return Vec::new();
@@ -141,39 +166,91 @@ fn resample(input: &[f32], source_rate: f64, target_rate: f64, channels: usize) 
         return Vec::new();
     }
 
+    const LOBES: f32 = 4.0;
+    const TABLE_RESOLUTION: usize = 4096;
+
     let step = source_rate / target_rate;
     let target_frames = ((source_frames as f64 / step).round() as usize).max(1);
+
+    // Below 1.0 this stretches the kernel and lowers its cutoff, acting as an
+    // anti-aliasing low-pass for downsampling.
+    let cutoff = if step > 1.0 { (1.0 / step) as f32 } else { 1.0 };
+    let radius = LOBES / cutoff;
+
+    let table = kernel_table(LOBES, TABLE_RESOLUTION);
     let mut output = vec![0.0; target_frames * channels];
+    let mut sums = vec![0.0f32; channels];
 
     for frame in 0..target_frames {
-        let position = frame as f64 * step;
+        let center = frame as f64 * step;
+        let first = (center - radius as f64).ceil() as isize;
+        let last = (center + radius as f64).floor() as isize;
 
-        if step > 1.0 {
-            let start = position.floor() as usize;
-            let end = ((position + step).ceil() as usize).min(source_frames);
-            let count = (end.saturating_sub(start)).max(1) as f32;
+        sums.fill(0.0);
+        let mut weight_sum = 0.0f32;
 
-            for channel in 0..channels {
-                let mut sum = 0.0;
-                for source in start..end.max(start + 1).min(source_frames) {
-                    sum += input[source * channels + channel];
-                }
-                output[frame * channels + channel] = sum / count;
+        for source in first..=last {
+            let distance = (center - source as f64) as f32;
+            let weight = lookup_kernel(&table, distance * cutoff, LOBES, TABLE_RESOLUTION);
+            if weight == 0.0 {
+                continue;
             }
-        } else {
-            let first = (position.floor() as usize).min(source_frames - 1);
-            let second = (first + 1).min(source_frames - 1);
-            let fraction = (position - first as f64) as f32;
 
-            for channel in 0..channels {
-                let a = input[first * channels + channel];
-                let b = input[second * channels + channel];
-                output[frame * channels + channel] = a + (b - a) * fraction;
+            let index = source.clamp(0, source_frames as isize - 1) as usize;
+            for (channel, sum) in sums.iter_mut().enumerate() {
+                *sum += input[index * channels + channel] * weight;
+            }
+            weight_sum += weight;
+        }
+
+        if weight_sum.abs() > f32::EPSILON {
+            for (channel, sum) in sums.iter().enumerate() {
+                output[frame * channels + channel] = sum / weight_sum;
             }
         }
     }
 
     output
+}
+
+fn kernel_table(lobes: f32, resolution: usize) -> Vec<f32> {
+    (0..=resolution)
+        .map(|index| {
+            let position = index as f32 / resolution as f32;
+            lanczos(-lobes + 2.0 * lobes * position, lobes)
+        })
+        .collect()
+}
+
+fn lookup_kernel(table: &[f32], x: f32, lobes: f32, resolution: usize) -> f32 {
+    if x <= -lobes || x >= lobes {
+        return 0.0;
+    }
+
+    let position = (x + lobes) / (2.0 * lobes) * resolution as f32;
+    let index = position.floor() as usize;
+    let fraction = position - index as f32;
+    let current = table[index.min(resolution)];
+    let next = table[(index + 1).min(resolution)];
+
+    current + (next - current) * fraction
+}
+
+fn lanczos(x: f32, lobes: f32) -> f32 {
+    if x.abs() >= lobes {
+        return 0.0;
+    }
+
+    sinc(x) * sinc(x / lobes)
+}
+
+fn sinc(x: f32) -> f32 {
+    if x.abs() < 1.0e-6 {
+        1.0
+    } else {
+        let value = std::f32::consts::PI * x;
+        value.sin() / value
+    }
 }
 
 #[cfg(test)]
@@ -244,5 +321,50 @@ mod tests {
 
         assert!((bus[0] - 0.5).abs() < 0.001);
         assert!((bus[1] + 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn resampling_preserves_a_constant_level() {
+        let samples = vec![0.5f32; 100];
+        let output = resample(&samples, 8_000.0, 48_000.0, 1);
+
+        assert!(!output.is_empty());
+        assert!(output.iter().all(|sample| (sample - 0.5).abs() < 0.001));
+    }
+
+    #[test]
+    fn resampling_preserves_sine_amplitude() {
+        let source_rate = 22_050.0f64;
+        let target_rate = 48_000.0f64;
+        let input: Vec<f32> = (0..4_000)
+            .map(|frame| {
+                (2.0 * std::f32::consts::PI * 1_000.0 * frame as f32 / source_rate as f32).sin()
+                    * 0.5
+            })
+            .collect();
+
+        let output = resample(&input, source_rate, target_rate, 1);
+        let middle = &output[500..output.len() - 500];
+        let rms =
+            (middle.iter().map(|sample| sample * sample).sum::<f32>() / middle.len() as f32).sqrt();
+
+        assert!((rms - 0.5 / 2.0f32.sqrt()).abs() < 0.02, "rms was {rms}");
+    }
+
+    #[test]
+    fn sample_voice_can_start_at_an_offset() {
+        let prepared = Arc::new(PreparedClip::new(
+            &clip(pcm16(&[16384, -16384, 8192, -8192]), 1, 2),
+            2.0,
+        ));
+        let layout = ChannelLayout::stereo();
+        let mut voice = SampleVoice::new_at(prepared, 1.0, 0.0, None, 1.0);
+        let mut bus = vec![0.0; layout.len()];
+
+        voice.advance(&mut bus, &layout);
+
+        let expected = 0.25 * 0.707;
+        assert!((bus[0] - expected).abs() < 0.001);
+        assert!((bus[1] - expected).abs() < 0.001);
     }
 }

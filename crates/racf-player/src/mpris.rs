@@ -1,34 +1,91 @@
 //! Optional MPRIS2 service.
 //!
-//! The service publishes what is playing (status, title, description, artist,
-//! album, length, position). It intentionally exposes no transport controls:
-//! `racf-player` plays a file once from the command line, so pausing or seeking
-//! has no meaning.
+//! The service publishes playback state: status, metadata, length, and
+//! position. It intentionally exposes no transport methods. The interactive
+//! `:` CLI can pause, seek, and loop locally, while this D-Bus interface stays
+//! a status-only view of what the player is doing.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use racf_core::{Document, Timeline};
 
-/// Keeps the MPRIS service alive and tells it when playback has finished.
+/// Status shared between the transport loop and the MPRIS thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaybackStatus {
+    Stopped,
+    Playing,
+    Paused,
+}
+
+impl PlaybackStatus {
+    const fn code(self) -> u8 {
+        match self {
+            PlaybackStatus::Stopped => 0,
+            PlaybackStatus::Playing => 1,
+            PlaybackStatus::Paused => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Self {
+        match code {
+            1 => PlaybackStatus::Playing,
+            2 => PlaybackStatus::Paused,
+            _ => PlaybackStatus::Stopped,
+        }
+    }
+}
+
+struct SharedState {
+    position_ms: AtomicU64,
+    status: AtomicU8,
+    stop: AtomicBool,
+}
+
+impl SharedState {
+    fn new() -> Self {
+        Self {
+            position_ms: AtomicU64::new(0),
+            status: AtomicU8::new(PlaybackStatus::Stopped.code()),
+            stop: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Keeps the MPRIS service alive and publishes transport state to it.
 ///
 /// Dropping the handle leaves the service running until the process exits,
-/// which is fine for a one-shot CLI player. Calling [`MprisHandle::stop`] marks
-/// the player as stopped first.
+/// which is fine for a player that owns the terminal. [`MprisHandle::stop`]
+/// marks playback as stopped first.
 pub struct MprisHandle {
-    stop: Arc<AtomicBool>,
+    state: Arc<SharedState>,
 }
 
 impl MprisHandle {
     fn disabled() -> Self {
         Self {
-            stop: Arc::new(AtomicBool::new(true)),
+            state: Arc::new(SharedState::new()),
         }
     }
 
+    /// Updates the position reported over D-Bus.
+    pub fn set_position(&self, position_ms: u64) {
+        self.state.position_ms.store(position_ms, Ordering::Relaxed);
+    }
+
+    pub fn set_status(&self, status: PlaybackStatus) {
+        self.state.status.store(status.code(), Ordering::Relaxed);
+    }
+
+    pub fn status(&self) -> PlaybackStatus {
+        PlaybackStatus::from_code(self.state.status.load(Ordering::Relaxed))
+    }
+
+    /// Marks the player as stopped and shuts the service thread down.
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.set_status(PlaybackStatus::Stopped);
+        self.state.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -63,19 +120,21 @@ pub fn start(
         length_ms: timeline.end_ms,
     };
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread_stop = Arc::clone(&stop);
+    let state = Arc::new(SharedState::new());
+    state
+        .status
+        .store(PlaybackStatus::Playing.code(), Ordering::Relaxed);
+    let thread_state = Arc::clone(&state);
 
     let result = std::thread::Builder::new()
         .name("racf-mpris".to_string())
-        .spawn(move || run(data, thread_stop));
+        .spawn(move || run(data, thread_state));
 
     if let Err(error) = result {
         eprintln!("[RACF] MPRIS could not start: {error}");
-        return MprisHandle::disabled();
     }
 
-    MprisHandle { stop }
+    MprisHandle { state }
 }
 
 #[derive(Clone, Debug)]
@@ -88,10 +147,18 @@ struct Data {
 }
 
 #[cfg(target_os = "linux")]
-fn run(data: Data, stop: Arc<AtomicBool>) {
+fn run(data: Data, state: Arc<SharedState>) {
     use std::time::Duration;
 
-    use mpris_server::{Metadata, PlaybackStatus, Player, Time};
+    use mpris_server::{Metadata, PlaybackStatus as MprisStatus, Player, Time};
+
+    fn to_mpris(status: PlaybackStatus) -> MprisStatus {
+        match status {
+            PlaybackStatus::Stopped => MprisStatus::Stopped,
+            PlaybackStatus::Playing => MprisStatus::Playing,
+            PlaybackStatus::Paused => MprisStatus::Paused,
+        }
+    }
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -131,32 +198,39 @@ fn run(data: Data, stop: Arc<AtomicBool>) {
             .can_seek(false)
             .can_go_next(false)
             .can_go_previous(false)
-            .playback_status(PlaybackStatus::Playing)
+            .playback_status(MprisStatus::Playing)
             .metadata(metadata.build())
             .build()
             .await?;
 
         tokio::task::spawn_local(player.run());
 
-        let started = std::time::Instant::now();
-        let mut ticker = tokio::time::interval(Duration::from_millis(500));
+        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+        let mut reported_status = PlaybackStatus::Playing;
+        let mut reported_position = u64::MAX;
 
         loop {
             ticker.tick().await;
 
-            if stop.load(Ordering::Relaxed) {
-                player.set_playback_status(PlaybackStatus::Stopped).await?;
+            if state.stop.load(Ordering::Relaxed) {
                 break;
             }
 
-            let elapsed = started.elapsed();
-            if elapsed.as_millis() as u64 >= data.length_ms {
-                player.set_position(Time::from_micros(elapsed.as_micros() as i64));
-                player.set_playback_status(PlaybackStatus::Stopped).await?;
-                break;
+            let status = PlaybackStatus::from_code(state.status.load(Ordering::Relaxed));
+            if status != reported_status {
+                player.set_playback_status(to_mpris(status)).await?;
+                reported_status = status;
             }
 
-            player.set_position(Time::from_micros(elapsed.as_micros() as i64));
+            let position = state.position_ms.load(Ordering::Relaxed);
+            if status != PlaybackStatus::Stopped && position != reported_position {
+                player.set_position(Time::from_millis(position as i64));
+                reported_position = position;
+            }
+        }
+
+        if reported_status != PlaybackStatus::Stopped {
+            player.set_playback_status(MprisStatus::Stopped).await?;
         }
 
         Ok::<(), mpris_server::zbus::Error>(())
@@ -168,4 +242,4 @@ fn run(data: Data, stop: Arc<AtomicBool>) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run(_data: Data, _stop: Arc<AtomicBool>) {}
+fn run(_data: Data, _state: Arc<SharedState>) {}

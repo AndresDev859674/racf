@@ -3,7 +3,7 @@ name = "racf-utils"
 description = "Conversion and inspection utilities for RACF files"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file = "../../LICENSE"
 
 [dependencies]
 anyhow.workspace = true

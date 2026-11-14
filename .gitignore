@@ -3,5 +3,8 @@
 
 MINE/
 target/
+TEST/
+TESTS/
+TESTING/
 
 *.py

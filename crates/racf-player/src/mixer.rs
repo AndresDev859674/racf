@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use racf_core::{AudioEvent, Channel, ChannelLayout, Document, NoteEvent};
 
+use crate::eq::{EqPreset, GraphicEq};
 use crate::sample::{PreparedClip, SampleVoice};
 use crate::voice::Voice;
 
@@ -18,6 +19,9 @@ pub struct MasterMixer {
     target_khz: Option<f32>,
     isolation_active: bool,
     isolated_target: Option<String>,
+    master_gain: f32,
+    paused: bool,
+    eq: GraphicEq,
 
     // Per-channel scratch state, sized to the document's channel layout.
     bus: Vec<f32>,
@@ -47,6 +51,9 @@ impl MasterMixer {
             target_khz: document.target_sample_rate.map(|rate| rate / 1000.0),
             isolation_active: false,
             isolated_target: None,
+            master_gain: 1.0,
+            paused: false,
+            eq: GraphicEq::new(sample_rate, channel_count),
             bus: vec![0.0; channel_count],
             lowpass: vec![0.0; channel_count],
             held: vec![0.0; channel_count],
@@ -56,6 +63,12 @@ impl MasterMixer {
 
     pub fn push_note(&mut self, note: &NoteEvent) {
         self.voices.push(Voice::from_event(note, self.sample_rate));
+    }
+
+    /// Starts a note partway through, used when seeking.
+    pub fn push_note_at(&mut self, note: &NoteEvent, offset_secs: f32) {
+        self.voices
+            .push(Voice::from_event_at(note, self.sample_rate, offset_secs));
     }
 
     pub fn push_audio(&mut self, event: &AudioEvent) {
@@ -71,9 +84,77 @@ impl MasterMixer {
         ));
     }
 
+    /// Starts an embedded clip at `offset_secs`, used when seeking.
+    pub fn push_audio_at(&mut self, event: &AudioEvent, offset_secs: f32) {
+        let Some(clip) = self.clips.get(event.clip_index) else {
+            return;
+        };
+
+        self.sample_voices.push(SampleVoice::new_at(
+            Arc::clone(clip),
+            event.gain,
+            event.pan,
+            event.channel,
+            offset_secs,
+        ));
+    }
+
     pub fn set_separation(&mut self, active: bool, target: Option<String>) {
         self.isolation_active = active;
         self.isolated_target = target;
+    }
+
+    /// Sets the master volume. `100.0` is unity gain; the usable range is
+    /// 0–200%.
+    pub fn set_master_volume_percent(&mut self, percent: f32) {
+        self.master_gain = percent.clamp(0.0, 200.0) / 100.0;
+    }
+
+    pub fn master_volume_percent(&self) -> f32 {
+        self.master_gain * 100.0
+    }
+
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    pub fn set_eq_preset(&mut self, preset: EqPreset) {
+        self.eq.set_preset(preset);
+    }
+
+    pub fn set_eq_band_gain(&mut self, index: usize, gain_db: f32) -> bool {
+        self.eq.set_band_gain(index, gain_db)
+    }
+
+    pub fn disable_eq(&mut self) {
+        self.eq.disable();
+    }
+
+    pub fn eq_label(&self) -> String {
+        self.eq.label()
+    }
+
+    pub fn eq_gains(&self) -> [f32; 10] {
+        self.eq.gains()
+    }
+
+    pub fn eq_enabled(&self) -> bool {
+        self.eq.is_enabled()
+    }
+
+    /// Clears all sounding voices and filter memory. Volume and EQ settings are
+    /// preserved. Used when seeking or looping.
+    pub fn reset(&mut self) {
+        self.voices.clear();
+        self.sample_voices.clear();
+        self.lowpass.fill(0.0);
+        self.held.fill(0.0);
+        self.hold_counter = 0;
+        self.eq.reset();
     }
 
     pub fn layout(&self) -> &ChannelLayout {
@@ -83,6 +164,11 @@ impl MasterMixer {
     /// Renders interleaved `f32` samples into `output`.
     pub fn render(&mut self, output: &mut [f32], device_channels: usize) {
         if device_channels == 0 {
+            return;
+        }
+
+        if self.paused {
+            output.fill(0.0);
             return;
         }
 
@@ -125,16 +211,9 @@ impl MasterMixer {
                 voice.add_to_bus(sample, &mut self.bus, &self.layout);
             }
 
-            if !self.isolation_active || self.isolated_target.is_none() {
-                for voice in &mut self.sample_voices {
-                    voice.advance(&mut self.bus, &self.layout);
-                }
-            }
-
-            for sample in &mut self.bus {
-                *sample = sample.clamp(-0.95, 0.95);
-            }
-
+            // Bitrate low-pass, sample-rate hold, and bit-depth quantization
+            // are characteristics of the synthesized format. Applying them to
+            // an embedded MP3-derived clip would only degrade it further.
             if let Some(alpha) = lowpass_cutoff {
                 for (state, sample) in self.lowpass.iter_mut().zip(self.bus.iter_mut()) {
                     *state += alpha * (*sample - *state);
@@ -159,7 +238,16 @@ impl MasterMixer {
                 }
             }
 
+            if !self.isolation_active || self.isolated_target.is_none() {
+                for voice in &mut self.sample_voices {
+                    voice.advance(&mut self.bus, &self.layout);
+                }
+            }
+
+            self.eq.process(&mut self.bus);
+
             downmix(&self.bus, &self.layout, frame);
+            apply_master(frame, self.master_gain);
         }
 
         self.voices.retain(Voice::is_active);
@@ -175,7 +263,6 @@ fn downmix(bus: &[f32], layout: &ChannelLayout, output: &mut [f32]) {
 
     if output.len() == bus.len() {
         output.copy_from_slice(bus);
-        clamp(output);
         return;
     }
 
@@ -243,14 +330,31 @@ fn downmix(bus: &[f32], layout: &ChannelLayout, output: &mut [f32]) {
             }
         }
     }
-
-    clamp(output);
 }
 
-fn clamp(samples: &mut [f32]) {
+/// Applies master volume and a soft-knee limiter.
+///
+/// Everything below the knee is untouched, so 100% volume remains transparent.
+/// Above it the curve bends continuously and approaches full scale instead of
+/// hard-clipping like the old `0.95` clamp.
+fn apply_master(samples: &mut [f32], gain: f32) {
     for sample in samples {
-        *sample = sample.clamp(-1.0, 1.0);
+        *sample = soft_limit(*sample * gain);
     }
+}
+
+fn soft_limit(sample: f32) -> f32 {
+    const KNEE: f32 = 0.75;
+    const HEADROOM: f32 = 1.0 - KNEE;
+
+    let magnitude = sample.abs();
+    if magnitude <= KNEE {
+        return sample;
+    }
+
+    let over = magnitude - KNEE;
+    let limited = KNEE + HEADROOM * (over / HEADROOM).tanh();
+    limited.copysign(sample)
 }
 
 #[cfg(test)]
@@ -328,5 +432,62 @@ mod tests {
         // A centered mono clip splits across the front pair with equal power.
         assert_close(output[0], 0.5 * 0.707);
         assert_close(output[1], 0.5 * 0.707);
+    }
+
+    #[test]
+    fn master_volume_scales_and_limits_without_hard_clipping() {
+        let mut transparent = [0.25, -0.5];
+        apply_master(&mut transparent, 1.0);
+        assert_close(transparent[0], 0.25);
+        assert_close(transparent[1], -0.5);
+
+        let mut boosted = [0.25, -0.5];
+        apply_master(&mut boosted, 4.0);
+        assert!(boosted[0] > 0.9 && boosted[0] < 1.0);
+        assert!(boosted[1] < -0.9 && boosted[1] > -1.0);
+    }
+
+    #[test]
+    fn volume_is_clamped_to_the_supported_range() {
+        let xml = r#"<racf channelLayout="stereo"></racf>"#;
+        let document = racf_core::parse_document(xml).unwrap();
+        let mut mixer = MasterMixer::new(&document, 44_100.0);
+
+        mixer.set_master_volume_percent(250.0);
+        assert!((mixer.master_volume_percent() - 200.0).abs() < f32::EPSILON);
+
+        mixer.set_master_volume_percent(-10.0);
+        assert!((mixer.master_volume_percent() - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn pause_outputs_silence_without_dropping_the_voice() {
+        let xml = r#"
+            <racf channelLayout="stereo">
+                <audio>
+                    <clip at="0ms" sampleRate="44100" channels="1" encoding="pcm16">
+                        <data>AEA=</data>
+                    </clip>
+                </audio>
+            </racf>
+        "#;
+        let document = racf_core::parse_document(xml).unwrap();
+        let mut mixer = MasterMixer::new(&document, 44_100.0);
+        mixer.push_audio(&AudioEvent {
+            clip_index: 0,
+            clip_id: "clip-0".to_string(),
+            gain: 1.0,
+            pan: 0.0,
+            channel: None,
+        });
+
+        mixer.set_paused(true);
+        let mut output = [1.0f32; 2];
+        mixer.render(&mut output, 2);
+        assert_eq!(output, [0.0, 0.0]);
+
+        mixer.set_paused(false);
+        mixer.render(&mut output, 2);
+        assert!(output.iter().any(|sample| *sample != 0.0));
     }
 }

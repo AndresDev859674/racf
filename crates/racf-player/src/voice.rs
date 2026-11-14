@@ -37,6 +37,13 @@ pub struct Voice {
 
 impl Voice {
     pub fn from_event(event: &NoteEvent, sample_rate: f32) -> Self {
+        Self::from_event_at(event, sample_rate, 0.0)
+    }
+
+    /// Creates a voice that starts `offset_secs` into its note, used when
+    /// seeking. The envelope continues from the new position instead of
+    /// restarting the attack.
+    pub fn from_event_at(event: &NoteEvent, sample_rate: f32, offset_secs: f32) -> Self {
         let (engine, distortion) = match &event.source {
             SoundSource::Oscillator {
                 waveform,
@@ -60,18 +67,20 @@ impl Voice {
         let duration_samples = (event.duration_secs.max(0.0) * sample_rate)
             .round()
             .max(1.0) as usize;
+        let offset_samples = (offset_secs.max(0.0) * sample_rate).round() as usize;
+        let active = offset_samples < duration_samples;
 
         Self {
             track_id: event.track_id.clone(),
             pan: event.pan,
             channel: event.channel,
-            active: true,
+            active,
             freq: event.frequency,
             phase: 0.0,
             phase2: 0.0,
             sample_rate,
             duration_samples,
-            current_sample: 0,
+            current_sample: offset_samples.min(duration_samples),
             distortion,
             gain: event.gain,
             engine,

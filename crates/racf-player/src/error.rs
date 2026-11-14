@@ -21,3 +21,9 @@ impl fmt::Display for PlayerError {
 }
 
 impl std::error::Error for PlayerError {}
+
+impl From<std::io::Error> for PlayerError {
+    fn from(error: std::io::Error) -> Self {
+        PlayerError::Audio(error.to_string())
+    }
+}

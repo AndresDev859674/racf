@@ -1,4 +1,4 @@
-//! Core types for the Readable Audio Code Format (RACF).
+//! Core types for the Readable Audio Code Factor (RACF).
 //!
 //! This crate owns the *format*: XML parsing, pitch/duration math, channel
 //! layouts, instrument definitions, embedded sampled audio, and compilation

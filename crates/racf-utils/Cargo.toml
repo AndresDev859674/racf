@@ -1,0 +1,20 @@
+[package]
+name = "racf-utils"
+description = "Conversion and inspection utilities for RACF files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+racf-core = { path = "../racf-core" }
+symphonia.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "racf-utils"
+path = "src/main.rs"

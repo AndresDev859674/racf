@@ -1,0 +1,10 @@
+[package]
+name = "racf-core"
+description = "RACF document model, parser, and timeline compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+roxmltree.workspace = true

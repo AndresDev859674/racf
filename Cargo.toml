@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/racf-core", "crates/racf-player", "crates/racf-utils"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+cpal = "0.15"
+roxmltree = "0.19"
+symphonia = { version = "0.5.4", default-features = false, features = ["mp3", "pcm", "wav"] }
+tempfile = "3"

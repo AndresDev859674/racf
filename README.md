@@ -16,7 +16,6 @@ crates/
                  embedded audio, timeline compiler
   racf-player/   DSP engines, realtime mixer, cpal output, MPRIS, CLI
   racf-utils/    MP3/WAV → .racf conversion, inspection, validation
-examples/        sample .racf documents
 ```
 
 `racf-core` has no dependency on an audio device. It answers **what should
@@ -48,9 +47,9 @@ mixes them in realtime.
 ## Running
 
 ```sh
-cargo run -p racf-player -- examples/stereo.racf
-cargo run -p racf-player -- --dry-run examples/stereo.racf
-cargo run -p racf-player -- --no-mpris examples/stereo.racf
+cargo run -p racf-player -- <file.racf>
+cargo run -p racf-player -- --dry-run <file.racf>
+cargo run -p racf-player -- --no-mpris <file.racf>
 ```
 
 `--dry-run` parses and compiles the document, prints a timeline preview, and
@@ -159,8 +158,8 @@ cargo run -p racf-utils -- convert song.mp3 -o song.racf \
 cargo run -p racf-utils -- convert song.mp3 --title "Night Drive" --artist Andres
 
 # Inspect or validate existing documents
-cargo run -p racf-utils -- inspect song.racf
-cargo run -p racf-utils -- validate examples/*.racf
+cargo run -p racf-utils -- inspect file.racf
+cargo run -p racf-utils -- validate one.racf two.racf
 ```
 
 Conversion defaults favor small files: `22050 Hz`, `mono`, `mulaw`. That is
@@ -274,9 +273,8 @@ downmixes to the real device:
 - Track items: `note`, `lyric`, `chord`, `rest`, `sequence`, `beat`, `tempo`,
   `force`/`gain`, `fade-in`, `fade-out`, `separation`
 
-A small channel-aware example lives in
-[`examples/channels.racf`](examples/channels.racf). It is also the metadata
-example; run it with `--dry-run` to see the published fields.
+A channel-aware sample document with metadata shows both features together: run
+it with `--dry-run` to see the published fields and the per-track routing.
 
 ## Development
 

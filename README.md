@@ -12,6 +12,7 @@
 
 </div>
 
+---
 
 RACF is an audio format that applies the philosophy of SVG to sound: a score is
 a readable, declarative text document that describes instruments, notes, timing,

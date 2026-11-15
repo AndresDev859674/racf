@@ -12,6 +12,7 @@ pub mod document;
 pub mod duration;
 pub mod error;
 pub mod instrument;
+pub mod lyrics;
 pub mod metadata;
 pub mod pitch;
 pub mod timeline;
@@ -26,6 +27,7 @@ pub use document::{
 pub use duration::{beats_to_ms, parse_duration, parse_target_duration, parse_time_ms};
 pub use error::RacfError;
 pub use instrument::{DrumType, InstrumentDef, InstrumentKind, VocalParams, Waveform};
+pub use lyrics::{LyricLine, Lyrics, LyricsFormat, LyricsTag};
 pub use metadata::Metadata;
 pub use pitch::parse_pitch;
 pub use timeline::{

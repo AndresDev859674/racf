@@ -17,6 +17,8 @@ pub struct Tags {
     pub description: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    /// Embedded lyrics (ID3 `USLT`/`SYLT`, Vorbis `LYRICS`, ...).
+    pub lyrics: Option<String>,
 }
 
 /// Decoded source audio, still at its native sample rate and channel count.
@@ -216,16 +218,29 @@ fn read_tags(metadata: &mut Metadata<'_>) -> Tags {
             Some(StandardTagKey::Album) if tags.album.is_none() => {
                 tags.album = Some(value.to_string());
             }
+            Some(StandardTagKey::Lyrics) if tags.lyrics.is_none() => {
+                tags.lyrics = Some(value.to_string());
+            }
             _ => {}
         }
 
+        let key = tag.key.to_ascii_lowercase();
         // Some taggers write comments as custom `TXXX:comment` frames, which
         // Symphonia cannot map to a standard key.
-        if tags.description.is_none() {
-            let key = tag.key.to_ascii_lowercase();
-            if key.contains("comment") || key.contains("description") {
-                tags.description = Some(value.to_string());
-            }
+        if tags.description.is_none() && (key.contains("comment") || key.contains("description")) {
+            tags.description = Some(value.to_string());
+        }
+        // Vorbis comments and some ID3 writers use these keys for lyrics.
+        if tags.lyrics.is_none()
+            && (key == "lyrics"
+                || key == "unsyncedlyrics"
+                || key == "unsynced_lyrics"
+                || key == "syncedlyrics"
+                || key == "synced_lyrics"
+                || key.starts_with("uslt")
+                || key.starts_with("sylt"))
+        {
+            tags.lyrics = Some(value.to_string());
         }
     }
 
@@ -244,6 +259,9 @@ fn merge_tags(existing: &mut Tags, incoming: Tags) {
     }
     if existing.album.is_none() {
         existing.album = incoming.album;
+    }
+    if existing.lyrics.is_none() {
+        existing.lyrics = incoming.lyrics;
     }
 }
 

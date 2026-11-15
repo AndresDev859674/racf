@@ -7,6 +7,7 @@ use crate::channel::{Channel, ChannelLayout};
 use crate::duration::{parse_duration, parse_target_duration};
 use crate::error::RacfError;
 use crate::instrument::{DrumType, InstrumentDef, InstrumentKind, VocalParams, Waveform};
+use crate::lyrics::{parse_lyrics, Lyrics};
 use crate::metadata::{parse_metadata, Metadata};
 
 pub const DEFAULT_TEMPO: f32 = 128.0;
@@ -25,6 +26,8 @@ pub struct Document {
     pub target_duration_secs: Option<f32>,
     pub channel_layout: ChannelLayout,
     pub metadata: Metadata,
+    /// Optional lyrics, either timed (LRC/SRT) or static text.
+    pub lyrics: Option<Lyrics>,
     pub imports: Vec<Import>,
     pub instruments: HashMap<String, InstrumentDef>,
     pub tracks: Vec<Track>,
@@ -236,6 +239,7 @@ pub fn parse_document(xml: &str) -> Result<Document, RacfError> {
     validate_channel_attributes(root)?;
     let channel_layout = parse_channel_layout(root)?;
     let metadata = parse_metadata(root);
+    let lyrics = parse_lyrics(root)?;
     let imports = parse_imports(root);
     let instruments = parse_definitions(root);
     let tracks = parse_score(root);
@@ -251,6 +255,7 @@ pub fn parse_document(xml: &str) -> Result<Document, RacfError> {
         target_duration_secs,
         channel_layout,
         metadata,
+        lyrics,
         imports,
         instruments,
         tracks,

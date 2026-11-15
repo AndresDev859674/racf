@@ -13,9 +13,9 @@ the tooling can evolve independently.
 crates/
   racf-core/     format model, XML parser, pitch/duration math,
                  channel layouts, instrument definitions, metadata,
-                 embedded audio, timeline compiler
+                 lyrics, embedded audio, timeline compiler
   racf-player/   DSP engines, realtime mixer, cpal output, MPRIS, CLI
-  racf-utils/    MP3/WAV → .racf conversion, inspection, validation
+  racf-utils/    MP3/WAV/FLAC → .racf conversion, inspection, validation
 ```
 
 `racf-core` has no dependency on an audio device. It answers **what should
@@ -29,7 +29,7 @@ audio and data in and out of the format**.
 .racf XML
    │  racf_core::parse_document
    ▼
-Document { tempo, layout, metadata, imports, instruments, tracks, audio_clips }
+Document { tempo, layout, metadata, lyrics, imports, instruments, tracks, audio_clips }
    │  racf_core::compile_timeline
    ▼
 Timeline { ScheduledEvent { timestamp_ms, action } }
@@ -50,12 +50,23 @@ mixes them in realtime.
 cargo run -p racf-player -- <file.racf>
 cargo run -p racf-player -- --dry-run <file.racf>
 cargo run -p racf-player -- --no-mpris <file.racf>
+cargo run -p racf-player -- --volume 80 --eq bass --loop <file.racf>
 ```
 
-`--dry-run` parses and compiles the document, prints a timeline preview, and
-does not open an audio device. This is useful for validating documents in CI or
-on machines without audio hardware. `--no-mpris` disables the D-Bus service;
-setting `RACF_NO_MPRIS=1` has the same effect.
+`--dry-run` parses and compiles the document, prints a tree report plus a
+timeline preview, and does not open an audio device. This is useful for
+validating documents in CI or on machines without audio hardware. `--no-mpris`
+disables the D-Bus service; setting `RACF_NO_MPRIS=1` has the same effect.
+
+Playback starts at `--volume 100`; `--eq` accepts `flat`, `bass`, `vocal`,
+`rock`, or `clarity`, and `--loop` repeats the timeline until stopped. The
+interactive status line also accepts commands (`:` opens the prompt) for
+volume, seeking, pause/resume, EQ bands, looping, and status.
+
+The loading path for embedded audio is optimized for large documents.
+Resampling uses precomputed polyphase Lanczos kernels and renders output frames
+in parallel, so multi-megabyte MP3-derived RACF files load in roughly a second
+instead of several.
 
 ## Metadata
 
@@ -78,8 +89,33 @@ is absent:
 <metadata title="Night Drive" artist="Andres" album="Sketches" />
 ```
 
-`racf-player` reports these fields and publishes them over MPRIS. `racf-utils`
-copies ID3 tags from the source file into the generated document.
+`racf-player` reports these fields in a tree-style summary and publishes them
+over MPRIS. `racf-utils` copies ID3/Vorbis tags from the source file into the
+generated document.
+
+## Lyrics
+
+A document can carry lyrics as plain text, LRC, or SubRip (SRT). Put a
+`<lyrics>` element at the top level or inside `<metadata>`:
+
+```xml
+<lyrics format="lrc">
+[ar:Andres]
+[ti:Night Drive]
+[00:01.50]First line
+[00:05.00][00:09.25]Repeated line
+</lyrics>
+```
+
+`format` may be `native`, `lrc`, or `srt`. Omitting it defaults to RACF's native
+format, which is one line per entry and also accepts LRC-style timestamps.
+Timed lyrics follow playback: `racf-player` highlights the active line below the
+`[RACF] playing` status line. Untimed lyrics are shown as a static block.
+
+LRC support includes multiple timestamps on one line (`[00:05.00][00:09.25]`),
+`[mm:ss.xx]` and `[hh:mm:ss.xx]` timestamps, header tags such as `[ar:…]`,
+`[ti:…]`, and `[al:…]`, and `[offset:…]`. SRT cues use the usual
+`HH:MM:SS,mmm --> HH:MM:SS,mmm` timing.
 
 ## Embedded audio
 
@@ -150,31 +186,62 @@ a single diagnostic is printed.
 # MP3 → .racf with embedded audio (the default output is input.racf)
 cargo run -p racf-utils -- convert song.mp3
 
-# Explicit output and quality controls
+# Highest quality: source rate/channels as 16-bit PCM
+cargo run -p racf-utils -- convert song.flac --quality raw
+
+# Explicit overrides on top of a profile
 cargo run -p racf-utils -- convert song.mp3 -o song.racf \
-    --sample-rate 16000 --channels 2 --encoding pcm16
+    --quality lossy --sample-rate 16000 --channels 2 --encoding pcm16
 
 # Metadata overrides (fall back to tags, then the input filename)
 cargo run -p racf-utils -- convert song.mp3 --title "Night Drive" --artist Andres
+
+# Import lyrics explicitly, force a format, or skip embedded/sidecar lyrics
+cargo run -p racf-utils -- convert song.mp3 --lyrics song.lrc
+cargo run -p racf-utils -- convert song.mp3 --lyrics words.txt --lyrics-format native
+cargo run -p racf-utils -- convert song.mp3 --no-lyrics
 
 # Inspect or validate existing documents
 cargo run -p racf-utils -- inspect file.racf
 cargo run -p racf-utils -- validate one.racf two.racf
 ```
 
-Conversion defaults favor small files: `22050 Hz`, `mono`, `mulaw`. That is
-roughly 22 KiB of audio data per second before base64 overhead. Raising the
-sample rate, using stereo, or choosing `pcm16` multiplies the size; a naive
-full-rate PCM dump is what turns a short song into a 200 MB document.
+### Output quality
+
+`convert` has two profiles:
+
+| Profile | Sample rate | Channels | Encoding | Typical use |
+| --- | --- | --- | --- | --- |
+| `lossy` (default) | 22,050 Hz | mono | µ-law | small files, speech, casual listening |
+| `raw` | source rate | source count, clamped to 1–2 | PCM16 | highest fidelity |
+
+`--sample-rate`, `--channels`, and `--encoding` override the selected profile.
+Lossy output is roughly 22 KiB of audio data per second before base64 overhead.
+Raw output multiplies that by the source rate, channel count, and two-byte
+samples; a naive full-rate PCM dump is what turns a short song into a 200 MB
+document.
 
 To keep accidental bloat out of the repository, conversion refuses to write a
 file larger than 64 MiB. Use `--max-size-mb N` to change the limit (`0` disables
 it) or `--allow-large` to write anyway. The error message suggests the usual
 fixes: lower `--sample-rate`, force `--channels 1`, or pick `--encoding mulaw`.
 
-Supported source formats are MP3 and WAV (the codecs enabled for Symphonia).
-Tags are read from the probe metadata revision; `TXXX:comment` frames are
-recognized as descriptions. Set `RACF_DEBUG_TAGS=1` to print the parsed tags.
+### Lyrics import
+
+When converting, lyrics come from the first available source:
+
+1. an explicit `--lyrics FILE` (the format is detected from `.lrc`/`.srt` or the
+   content unless `--lyrics-format` overrides it);
+2. an embedded lyrics tag (`USLT`/`SYLT`, Vorbis `LYRICS`, …);
+3. a sidecar `.lrc` or `.srt` file next to the input.
+
+`--no-lyrics` skips the embedded and sidecar sources. LRC header tags `ti`,
+`ar`, and `al` fill missing title, artist, and album fields during conversion.
+
+Supported source formats are MP3, WAV, and FLAC (the codecs enabled for
+Symphonia). Tags are read from the probe metadata revision; `TXXX:comment`
+frames are recognized as descriptions. Set `RACF_DEBUG_TAGS=1` to print the
+parsed tags.
 
 ## Channel routing
 
@@ -265,6 +332,7 @@ downmixes to the real device:
 - Root: `tempo`, `timeSignature`, `bitDepth`, `bitrate`, `sampleRate`/`kHz`,
   `targetDuration`, `channelLayout`
 - `<metadata>` / `<title>` / `<description>` / `<artist>` / `<album>`
+- `<lyrics format="native|lrc|srt">` with plain, LRC, or SRT text
 - `<audio>` / `<clip>` with `<data>` base64 payload
 - `<imports>` / `<import src="import::..." alias="...">`
 - `<definitions>` / `<instrument>` with `oscillator`, distortion `effect`,

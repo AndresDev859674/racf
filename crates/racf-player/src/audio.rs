@@ -229,7 +229,8 @@ impl<'a> Transport<'a> {
                 let position = self.position();
                 self.mpris.set_position(position.min(self.timeline.end_ms));
                 let status = self.status_line(position);
-                self.ui.render(&status)?;
+                let lyrics = self.lyrics_lines(position);
+                self.ui.render(&status, &lyrics)?;
                 self.next_ui = now + UI_TICK;
             }
 
@@ -477,6 +478,38 @@ impl<'a> Transport<'a> {
             eq_label: &eq_label,
             looping: self.looping,
         })
+    }
+
+    /// Lines shown directly below the transport status.
+    ///
+    /// Timed lyrics follow playback and show the active line. Untimed lyrics
+    /// are shown as a static block so plain-text lyric files remain readable.
+    fn lyrics_lines(&self, position: u64) -> Vec<String> {
+        let Some(lyrics) = self.document.lyrics.as_ref() else {
+            return Vec::new();
+        };
+
+        if lyrics.is_timed() {
+            let Some(line) = lyrics.active_line(position) else {
+                return Vec::new();
+            };
+            return line
+                .text
+                .lines()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(|text| format!("[RACF] ♪ {text}"))
+                .collect();
+        }
+
+        lyrics
+            .lines
+            .iter()
+            .flat_map(|line| line.text.lines())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| format!("[RACF]   {text}"))
+            .collect()
     }
 
     fn status_report(&self) -> String {

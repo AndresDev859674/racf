@@ -7,7 +7,7 @@ use racf_core::{AudioClip, Channel, ChannelLayout};
 pub struct PreparedClip {
     pub id: String,
     /// Interleaved frames at the device sample rate.
-    pub samples: Arc<[f32]>,
+    pub samples: Vec<f32>,
     pub channels: usize,
     pub sample_rate: f32,
 }
@@ -25,7 +25,7 @@ impl PreparedClip {
 
         Self {
             id: clip.id.clone(),
-            samples: samples.into(),
+            samples,
             channels,
             sample_rate: device_rate,
         }
@@ -152,6 +152,10 @@ fn add_mono(
 /// and downsampling widens the kernel so content above the new Nyquist limit is
 /// filtered out rather than folded back as aliasing. Weights are normalized,
 /// which also keeps constant signals exactly constant at the edges.
+///
+/// Kernels are precomputed per fractional output phase (polyphase resampling)
+/// and output frames are rendered in parallel, which keeps loading large
+/// embedded clips fast.
 fn resample(input: &[f32], source_rate: f64, target_rate: f64, channels: usize) -> Vec<f32> {
     if input.is_empty() || channels == 0 || source_rate <= 0.0 || target_rate <= 0.0 {
         return Vec::new();
@@ -167,7 +171,6 @@ fn resample(input: &[f32], source_rate: f64, target_rate: f64, channels: usize) 
     }
 
     const LOBES: f32 = 4.0;
-    const TABLE_RESOLUTION: usize = 4096;
 
     let step = source_rate / target_rate;
     let target_frames = ((source_frames as f64 / step).round() as usize).max(1);
@@ -177,63 +180,122 @@ fn resample(input: &[f32], source_rate: f64, target_rate: f64, channels: usize) 
     let cutoff = if step > 1.0 { (1.0 / step) as f32 } else { 1.0 };
     let radius = LOBES / cutoff;
 
-    let table = kernel_table(LOBES, TABLE_RESOLUTION);
+    let kernel = PolyphaseKernel::new(radius, cutoff, LOBES);
+    let context = ResampleContext {
+        input,
+        source_frames: source_frames as isize,
+        step,
+        channels,
+        kernel: &kernel,
+    };
+
     let mut output = vec![0.0; target_frames * channels];
-    let mut sums = vec![0.0f32; channels];
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
 
-    for frame in 0..target_frames {
-        let center = frame as f64 * step;
-        let first = (center - radius as f64).ceil() as isize;
-        let last = (center + radius as f64).floor() as isize;
-
-        sums.fill(0.0);
-        let mut weight_sum = 0.0f32;
-
-        for source in first..=last {
-            let distance = (center - source as f64) as f32;
-            let weight = lookup_kernel(&table, distance * cutoff, LOBES, TABLE_RESOLUTION);
-            if weight == 0.0 {
-                continue;
-            }
-
-            let index = source.clamp(0, source_frames as isize - 1) as usize;
-            for (channel, sum) in sums.iter_mut().enumerate() {
-                *sum += input[index * channels + channel] * weight;
-            }
-            weight_sum += weight;
-        }
-
-        if weight_sum.abs() > f32::EPSILON {
-            for (channel, sum) in sums.iter().enumerate() {
-                output[frame * channels + channel] = sum / weight_sum;
-            }
-        }
+    if workers <= 1 || target_frames < 65_536 {
+        render_frames(&context, 0, &mut output);
+        return output;
     }
+
+    let chunk_frames = target_frames.div_ceil(workers);
+    std::thread::scope(|scope| {
+        for (index, chunk) in output.chunks_mut(chunk_frames * channels).enumerate() {
+            let context = &context;
+            let start = index * chunk_frames;
+            scope.spawn(move || render_frames(context, start, chunk));
+        }
+    });
 
     output
 }
 
-fn kernel_table(lobes: f32, resolution: usize) -> Vec<f32> {
-    (0..=resolution)
-        .map(|index| {
-            let position = index as f32 / resolution as f32;
-            lanczos(-lobes + 2.0 * lobes * position, lobes)
-        })
-        .collect()
+/// Number of fractional phases in the polyphase kernel table.
+const PHASES: usize = 1024;
+
+/// Precomputed, normalized Lanczos kernels indexed by fractional output phase.
+///
+/// Every output frame uses the same tap offsets; only the phase (where the
+/// output sample falls between two source samples) changes. Building these
+/// kernels once avoids evaluating `sin` and a table lookup for every tap of
+/// every output frame.
+struct PolyphaseKernel {
+    first_offset: isize,
+    taps: usize,
+    weights: Vec<f32>,
 }
 
-fn lookup_kernel(table: &[f32], x: f32, lobes: f32, resolution: usize) -> f32 {
-    if x <= -lobes || x >= lobes {
-        return 0.0;
+impl PolyphaseKernel {
+    fn new(radius: f32, cutoff: f32, lobes: f32) -> Self {
+        let first_offset = -(radius.floor() as isize);
+        let last_offset = radius.ceil() as isize;
+        let taps = (last_offset - first_offset + 1) as usize;
+        let mut weights = vec![0.0f32; PHASES * taps];
+
+        for phase in 0..PHASES {
+            let fraction = phase as f32 / PHASES as f32;
+            let slice = &mut weights[phase * taps..(phase + 1) * taps];
+            let mut sum = 0.0f32;
+
+            for (tap, offset) in (first_offset..=last_offset).enumerate() {
+                let weight = lanczos((fraction - offset as f32) * cutoff, lobes);
+                slice[tap] = weight;
+                sum += weight;
+            }
+
+            if sum.abs() > f32::EPSILON {
+                for weight in slice.iter_mut() {
+                    *weight /= sum;
+                }
+            }
+        }
+
+        Self {
+            first_offset,
+            taps,
+            weights,
+        }
     }
 
-    let position = (x + lobes) / (2.0 * lobes) * resolution as f32;
-    let index = position.floor() as usize;
-    let fraction = position - index as f32;
-    let current = table[index.min(resolution)];
-    let next = table[(index + 1).min(resolution)];
+    fn phase_weights(&self, phase: usize) -> &[f32] {
+        let start = phase.min(PHASES - 1) * self.taps;
+        &self.weights[start..start + self.taps]
+    }
+}
 
-    current + (next - current) * fraction
+struct ResampleContext<'a> {
+    input: &'a [f32],
+    source_frames: isize,
+    step: f64,
+    channels: usize,
+    kernel: &'a PolyphaseKernel,
+}
+
+/// Renders `output` (interleaved frames starting at `start`) from the context.
+fn render_frames(context: &ResampleContext<'_>, start: usize, output: &mut [f32]) {
+    let channels = context.channels;
+    let mut sums = vec![0.0f32; channels];
+
+    for (local, frame_output) in output.chunks_mut(channels).enumerate() {
+        let frame = start + local;
+        let center = frame as f64 * context.step;
+        let base = center.floor() as isize;
+        let fraction = (center - base as f64) as f32;
+        let phase = (fraction * PHASES as f32) as usize;
+
+        sums.fill(0.0);
+        for (tap, weight) in context.kernel.phase_weights(phase).iter().enumerate() {
+            let source = (base + context.kernel.first_offset + tap as isize)
+                .clamp(0, context.source_frames - 1) as usize;
+            let source_start = source * channels;
+            for (channel, sum) in sums.iter_mut().enumerate() {
+                *sum += context.input[source_start + channel] * weight;
+            }
+        }
+
+        frame_output.copy_from_slice(&sums);
+    }
 }
 
 fn lanczos(x: f32, lobes: f32) -> f32 {

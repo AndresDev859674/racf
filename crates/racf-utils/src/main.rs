@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use racf_core::{
-    compile_timeline, parse_document, Document, Metadata, SampleEncoding, ScheduledAction,
+    compile_timeline, parse_document, Document, LyricsFormat, Metadata, SampleEncoding,
+    ScheduledAction,
 };
-use racf_utils::{convert_file, write_document, ConvertOptions};
+use racf_utils::{convert_file, load_lyrics, write_document, ConvertOptions, OutputQuality};
 
 #[derive(Parser)]
 #[command(
@@ -20,7 +21,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Convert an MP3 (or WAV) into a RACF document with embedded audio
+    /// Convert an audio file (MP3, WAV, or FLAC) into a RACF document
     Convert(ConvertArgs),
     /// Show metadata, tracks, and embedded audio details
     Inspect {
@@ -37,24 +38,28 @@ enum Command {
 
 #[derive(Args)]
 struct ConvertArgs {
-    /// Input audio file (MP3 or WAV)
+    /// Input audio file (MP3, WAV, or FLAC)
     input: PathBuf,
 
     /// Output path (defaults to the input name with a .racf extension)
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Target sample rate in Hz
-    #[arg(long, default_value_t = 22_050)]
-    sample_rate: u32,
+    /// Fidelity profile: lossy is small, raw keeps the source rate as PCM16
+    #[arg(long, value_enum, default_value_t = QualityArg::Lossy)]
+    quality: QualityArg,
 
-    /// Target channel count (1 = mono, 2 = stereo)
-    #[arg(long, default_value_t = 1)]
-    channels: u8,
+    /// Target sample rate in Hz (default: quality profile)
+    #[arg(long)]
+    sample_rate: Option<u32>,
 
-    /// Sample encoding used inside the RACF file
-    #[arg(long, value_enum, default_value_t = EncodingArg::Mulaw)]
-    encoding: EncodingArg,
+    /// Target channel count, 1 = mono, 2 = stereo (default: quality profile)
+    #[arg(long)]
+    channels: Option<u8>,
+
+    /// Sample encoding used inside the RACF file (default: quality profile)
+    #[arg(long, value_enum)]
+    encoding: Option<EncodingArg>,
 
     /// Document title (falls back to the file's tag, then its filename)
     #[arg(long)]
@@ -72,6 +77,18 @@ struct ConvertArgs {
     #[arg(long)]
     album: Option<String>,
 
+    /// Import lyrics from this .lrc or .srt file
+    #[arg(long, value_name = "FILE")]
+    lyrics: Option<PathBuf>,
+
+    /// Force the lyrics format instead of detecting it
+    #[arg(long, value_enum)]
+    lyrics_format: Option<LyricsFormatArg>,
+
+    /// Do not import embedded tags or sidecar .lrc/.srt lyrics
+    #[arg(long)]
+    no_lyrics: bool,
+
     /// Refuse to write files larger than this many MiB (0 disables the limit)
     #[arg(long, default_value_t = 64)]
     max_size_mb: u64,
@@ -82,8 +99,25 @@ struct ConvertArgs {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum QualityArg {
+    /// 22.05 kHz, mono, G.711 µ-law (smallest)
+    Lossy,
+    /// Source rate and channels, 16-bit PCM (highest quality)
+    Raw,
+}
+
+impl From<QualityArg> for OutputQuality {
+    fn from(value: QualityArg) -> Self {
+        match value {
+            QualityArg::Lossy => OutputQuality::Lossy,
+            QualityArg::Raw => OutputQuality::Raw,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum EncodingArg {
-    /// G.711 µ-law, 1 byte per sample (recommended)
+    /// G.711 µ-law, 1 byte per sample (recommended for lossy output)
     Mulaw,
     /// Unsigned 8-bit PCM, 1 byte per sample
     Pcm8,
@@ -97,6 +131,26 @@ impl From<EncodingArg> for SampleEncoding {
             EncodingArg::Mulaw => SampleEncoding::Mulaw,
             EncodingArg::Pcm8 => SampleEncoding::PcmU8,
             EncodingArg::Pcm16 => SampleEncoding::PcmI16Le,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LyricsFormatArg {
+    /// Standard LRC with [mm:ss.xx] timestamps
+    Lrc,
+    /// SubRip subtitles with HH:MM:SS,mmm cues
+    Srt,
+    /// Plain RACF lyric lines
+    Native,
+}
+
+impl From<LyricsFormatArg> for LyricsFormat {
+    fn from(value: LyricsFormatArg) -> Self {
+        match value {
+            LyricsFormatArg::Lrc => LyricsFormat::Lrc,
+            LyricsFormatArg::Srt => LyricsFormat::Srt,
+            LyricsFormatArg::Native => LyricsFormat::Native,
         }
     }
 }
@@ -124,16 +178,27 @@ fn convert(args: ConvertArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| args.input.with_extension("racf"));
 
+    let lyrics = match &args.lyrics {
+        Some(path) => Some(load_lyrics(
+            path,
+            args.lyrics_format.map(LyricsFormat::from),
+        )?),
+        None => None,
+    };
+
     let options = ConvertOptions {
+        quality: args.quality.into(),
         sample_rate: args.sample_rate,
         channels: args.channels,
-        encoding: args.encoding.into(),
+        encoding: args.encoding.map(SampleEncoding::from),
         metadata: Metadata {
             title: args.title.clone(),
             description: args.description.clone(),
             artist: args.artist.clone(),
             album: args.album.clone(),
         },
+        lyrics,
+        include_lyrics: !args.no_lyrics,
     };
 
     let conversion = convert_file(&args.input, &options)?;
@@ -170,11 +235,12 @@ fn convert(args: ConvertArgs) -> Result<()> {
         format_bytes(source_bytes),
     );
     println!(
-        "  output: {} | {} Hz | {} channel(s) | {}",
+        "  output: {} | {} Hz | {} channel(s) | {} | {} profile",
         format_duration(conversion.output_duration_secs),
-        args.sample_rate,
-        args.channels,
-        args.encoding_label(),
+        conversion.output_sample_rate,
+        conversion.output_channels,
+        conversion.output_encoding.name(),
+        conversion.quality.name(),
     );
     println!(
         "  embedded audio: {} | RACF file: {}",
@@ -193,6 +259,21 @@ fn convert(args: ConvertArgs) -> Result<()> {
     }
     if let Some(description) = &conversion.metadata.description {
         println!("  description: {description}");
+    }
+
+    match (&conversion.lyrics, &conversion.lyrics_source) {
+        (Some(lyrics), source) => {
+            let timing = if lyrics.is_timed() { "timed" } else { "static" };
+            let source = source.as_deref().unwrap_or("unknown source");
+            println!(
+                "  lyrics: {} line(s) | {} | {} | from {}",
+                lyrics.line_count(),
+                lyrics.format.name(),
+                timing,
+                source,
+            );
+        }
+        (None, _) => println!("  lyrics: none"),
     }
 
     Ok(())
@@ -233,6 +314,18 @@ fn inspect(path: &Path) -> Result<()> {
             format_bytes(clip.data.len() as u64),
             format_duration(clip.duration_secs()),
         );
+    }
+
+    if let Some(lyrics) = &document.lyrics {
+        let timing = if lyrics.is_timed() { "timed" } else { "static" };
+        println!(
+            "  lyrics: {} line(s) | {} | {}",
+            lyrics.line_count(),
+            lyrics.format.name(),
+            timing,
+        );
+    } else {
+        println!("  lyrics: none");
     }
 
     for track in &document.tracks {
@@ -332,15 +425,5 @@ fn format_bytes(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.2} {}", UNITS[unit])
-    }
-}
-
-impl ConvertArgs {
-    fn encoding_label(&self) -> &'static str {
-        match self.encoding {
-            EncodingArg::Mulaw => "mulaw",
-            EncodingArg::Pcm8 => "pcm8",
-            EncodingArg::Pcm16 => "pcm16",
-        }
     }
 }

@@ -64,69 +64,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let document = parse_document(&source)?;
     let timeline = compile_timeline(&document);
 
-    let voices = timeline
-        .events
-        .iter()
-        .filter(|event| matches!(event.action, ScheduledAction::Play(_)))
-        .count();
-    let audio_events = timeline
-        .events
-        .iter()
-        .filter(|event| matches!(event.action, ScheduledAction::PlayAudio(_)))
-        .count();
-
-    println!(
-        "[RACF] {} | Tempo: {:.1} BPM | Bit depth: {}-bit | Bitrate: {} kbps | Layout: {}",
-        path.display(),
-        timeline.effective_tempo,
-        document.bit_depth,
-        document.bitrate_kbps,
-        document.channel_layout,
-    );
-    println!(
-        "[RACF] {} track(s) | {} audio clip(s) | {} timeline event(s) | {} voice(s) | ends at {:.2}s",
-        document.tracks.len(),
-        document.audio_clips.len(),
-        timeline.events.len(),
-        voices,
-        timeline.end_ms as f32 / 1000.0,
-    );
-
-    if !document.metadata.is_empty() {
-        let mut parts = Vec::new();
-        if let Some(title) = &document.metadata.title {
-            parts.push(format!("title={title:?}"));
-        }
-        if let Some(artist) = &document.metadata.artist {
-            parts.push(format!("artist={artist:?}"));
-        }
-        if let Some(album) = &document.metadata.album {
-            parts.push(format!("album={album:?}"));
-        }
-        println!("[RACF] Metadata: {}", parts.join(" | "));
-
-        if let Some(description) = &document.metadata.description {
-            println!("[RACF] Description: {description}");
-        }
-    }
-
-    if audio_events > 0 && voices == 0 {
-        println!(
-            "[RACF] Embedded audio: {} clip(s), {:.2}s of sampled audio",
-            document.audio_clips.len(),
-            document
-                .audio_clips
-                .iter()
-                .map(|clip| clip.duration_secs())
-                .sum::<f32>(),
-        );
-    }
-
-    if let Some(target) = document.target_duration_secs {
-        println!(
-            "[RACF] targetDuration: {:.1}s -> auto-scaled base tempo to {:.1} BPM",
-            target, timeline.effective_tempo
-        );
+    for line in racf_player::report::render(&path.display().to_string(), &document, &timeline) {
+        println!("[RACF] {line}");
     }
 
     if dry_run {

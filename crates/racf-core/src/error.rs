@@ -17,6 +17,8 @@ pub enum RacfError {
     InvalidChannelLayout,
     /// An embedded audio clip was malformed.
     InvalidAudio { clip: String, message: String },
+    /// The `<lyrics>` element could not be interpreted.
+    InvalidLyrics { message: String },
 }
 
 impl fmt::Display for RacfError {
@@ -43,6 +45,7 @@ impl fmt::Display for RacfError {
             RacfError::InvalidAudio { clip, message } => {
                 write!(f, "invalid audio clip {clip:?}: {message}")
             }
+            RacfError::InvalidLyrics { message } => write!(f, "invalid lyrics: {message}"),
         }
     }
 }

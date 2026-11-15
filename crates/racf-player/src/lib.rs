@@ -11,6 +11,7 @@ pub mod eq;
 pub mod error;
 pub mod mixer;
 pub mod mpris;
+pub mod report;
 pub mod sample;
 pub mod ui;
 pub mod voice;

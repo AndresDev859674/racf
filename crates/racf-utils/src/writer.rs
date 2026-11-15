@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use base64::Engine as _;
-use racf_core::{Channel, Metadata, SampleEncoding};
+use racf_core::{Channel, Lyrics, Metadata, SampleEncoding};
 
 /// Description of one clip to embed.
 pub struct ClipSpec<'a> {
@@ -17,7 +17,11 @@ pub struct ClipSpec<'a> {
 }
 
 /// Renders a complete, readable RACF document around an embedded audio clip.
-pub fn render_document(metadata: &Metadata, clip: &ClipSpec<'_>) -> String {
+pub fn render_document(
+    metadata: &Metadata,
+    lyrics: Option<&Lyrics>,
+    clip: &ClipSpec<'_>,
+) -> String {
     let mut output = String::new();
     let frame_bytes = clip.channels as usize * clip.encoding.bytes_per_sample();
     let frames = clip.data.len().checked_div(frame_bytes).unwrap_or(0);
@@ -38,6 +42,15 @@ pub fn render_document(metadata: &Metadata, clip: &ClipSpec<'_>) -> String {
         write_field(&mut output, "artist", metadata.artist.as_deref());
         write_field(&mut output, "album", metadata.album.as_deref());
         output.push_str("    </metadata>\n");
+    }
+
+    if let Some(lyrics) = lyrics.filter(|lyrics| !lyrics.raw.trim().is_empty()) {
+        writeln!(output, "    <lyrics format=\"{}\">", lyrics.format.name()).unwrap();
+        // Keep the lyric text flush-left so the parser can round-trip the
+        // original timestamps and indentation.
+        output.push_str(&escape_text(lyrics.raw.trim_end()));
+        output.push('\n');
+        output.push_str("    </lyrics>\n");
     }
 
     output.push_str("    <audio>\n");
@@ -122,7 +135,7 @@ mod tests {
             data: &data,
         };
 
-        let xml = render_document(&metadata, &clip);
+        let xml = render_document(&metadata, None, &clip);
         let document = parse_document(&xml).unwrap();
 
         assert_eq!(document.metadata.title.as_deref(), Some("A & B"));
@@ -130,5 +143,34 @@ mod tests {
         assert_eq!(document.audio_clips.len(), 1);
         assert_eq!(document.audio_clips[0].data, data);
         assert!((document.audio_clips[0].duration_secs() - 0.01).abs() < 0.0001);
+    }
+
+    #[test]
+    fn rendered_document_round_trips_lyrics() {
+        let metadata = Metadata::default();
+        let lyrics = Lyrics::parse(
+            racf_core::LyricsFormat::Lrc,
+            "[ar:Artist]\n[00:01.00]A & B < C\n",
+        );
+        let data = vec![0xffu8; 10];
+        let clip = ClipSpec {
+            id: "main",
+            at_ms: 0,
+            gain: 1.0,
+            pan: 0.0,
+            channel: None,
+            sample_rate: 8_000,
+            channels: 1,
+            encoding: SampleEncoding::Mulaw,
+            data: &data,
+        };
+
+        let xml = render_document(&metadata, Some(&lyrics), &clip);
+        let document = parse_document(&xml).unwrap();
+        let parsed = document.lyrics.unwrap();
+
+        assert_eq!(parsed.format, racf_core::LyricsFormat::Lrc);
+        assert_eq!(parsed.tag("ar"), Some("Artist"));
+        assert_eq!(parsed.lines[0].text, "A & B < C");
     }
 }

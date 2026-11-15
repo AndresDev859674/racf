@@ -12,5 +12,5 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 cpal = "0.15"
 roxmltree = "0.19"
-symphonia = { version = "0.5.4", default-features = false, features = ["mp3", "pcm", "wav"] }
+symphonia = { version = "0.5.4", default-features = false, features = ["flac", "mp3", "pcm", "wav"] }
 tempfile = "3"

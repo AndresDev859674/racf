@@ -37,11 +37,11 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Owns the live status line.
+/// Owns the live status block: transport state, lyrics, and the prompt.
 pub struct Ui {
     interactive: bool,
     prompt: Option<String>,
-    line_active: bool,
+    drawn_lines: usize,
 }
 
 impl Ui {
@@ -49,7 +49,7 @@ impl Ui {
         Self {
             interactive,
             prompt: None,
-            line_active: false,
+            drawn_lines: 0,
         }
     }
 
@@ -57,29 +57,39 @@ impl Ui {
         self.prompt = prompt;
     }
 
-    /// Redraws the status or prompt on the current terminal line.
-    pub fn render(&mut self, status: &str) -> io::Result<()> {
+    /// Redraws the status block: the status line, any lyric lines, and the
+    /// command prompt when it is open.
+    pub fn render(&mut self, status: &str, lyrics: &[String]) -> io::Result<()> {
         if !self.interactive {
             return Ok(());
         }
 
-        let text = match &self.prompt {
-            Some(buffer) => format!(": {buffer}"),
-            None => status.to_string(),
-        };
-
         let mut stdout = io::stdout();
-        write!(stdout, "\r\x1b[2K{text}")?;
+        self.erase_block(&mut stdout)?;
+
+        let mut lines = Vec::with_capacity(lyrics.len() + 2);
+        lines.push(status.to_string());
+        lines.extend(lyrics.iter().cloned());
+        if let Some(buffer) = &self.prompt {
+            lines.push(format!(": {buffer}"));
+        }
+
+        for (index, line) in lines.iter().enumerate() {
+            if index > 0 {
+                write!(stdout, "\r\n")?;
+            }
+            write!(stdout, "\x1b[2K{line}")?;
+        }
         stdout.flush()?;
-        self.line_active = true;
+        self.drawn_lines = lines.len();
         Ok(())
     }
 
-    /// Prints a message without leaving it glued to the live status line.
+    /// Prints a message without leaving it glued to the live status block.
     pub fn log(&mut self, message: &str) -> io::Result<()> {
-        self.clear_line()?;
-
         let mut stdout = io::stdout();
+        self.erase_block(&mut stdout)?;
+
         if self.interactive {
             let normalized = message.replace('\n', "\r\n");
             write!(stdout, "{normalized}\r\n")?;
@@ -89,28 +99,35 @@ impl Ui {
         stdout.flush()
     }
 
-    /// Clears the status line before the process returns to the shell.
+    /// Clears the status block before the process returns to the shell.
     pub fn finish(&mut self) -> io::Result<()> {
-        self.clear_line()
+        let mut stdout = io::stdout();
+        self.erase_block(&mut stdout)?;
+        stdout.flush()
     }
 
-    fn clear_line(&mut self) -> io::Result<()> {
-        if !self.interactive || !self.line_active {
-            self.line_active = false;
+    /// Moves back to the first line of the block and clears every line.
+    fn erase_block(&mut self, stdout: &mut io::Stdout) -> io::Result<()> {
+        if !self.interactive || self.drawn_lines == 0 {
+            self.drawn_lines = 0;
             return Ok(());
         }
 
-        let mut stdout = io::stdout();
+        // The cursor rests at the end of the last drawn line.
         write!(stdout, "\r\x1b[2K")?;
-        stdout.flush()?;
-        self.line_active = false;
+        for _ in 1..self.drawn_lines {
+            write!(stdout, "\x1b[1A\r\x1b[2K")?;
+        }
+        self.drawn_lines = 0;
         Ok(())
     }
 }
 
 impl Drop for Ui {
     fn drop(&mut self) {
-        let _ = self.clear_line();
+        let mut stdout = io::stdout();
+        let _ = self.erase_block(&mut stdout);
+        let _ = stdout.flush();
     }
 }
 

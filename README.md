@@ -8,7 +8,7 @@
 # RACF — Readable Audio Code Factor
 ### MIDI is great, but it needs more
 
-***I’m fed up with using software to compose music... well, what if I created an SVG, but for audio?***
+***Im fed up with using software to compose music... well, what if I created an SVG, but for audio?***
 
 </div>
 

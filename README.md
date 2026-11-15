@@ -1,4 +1,17 @@
+
+<p align="center">
+  <img src="https://codeberg.org/racf/source/raw/branch/main/assets/logo.png" width="480" alt="RACF">
+</p>
+
+<div align="center">
+
 # RACF — Readable Audio Code Factor
+### MIDI is great, but it needs more
+
+***I’m fed up with using software to compose music... well, what if I created an SVG, but for audio?***
+
+</div>
+
 
 RACF is an audio format that applies the philosophy of SVG to sound: a score is
 a readable, declarative text document that describes instruments, notes, timing,

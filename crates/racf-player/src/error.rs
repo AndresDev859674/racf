@@ -6,6 +6,7 @@ pub enum PlayerError {
     NoOutputDevice,
     Audio(String),
     UnsupportedSampleFormat(String),
+    Engine(String),
 }
 
 impl fmt::Display for PlayerError {
@@ -16,6 +17,7 @@ impl fmt::Display for PlayerError {
             PlayerError::UnsupportedSampleFormat(format) => {
                 write!(f, "unsupported output sample format: {format}")
             }
+            PlayerError::Engine(message) => write!(f, "playback engine error: {message}"),
         }
     }
 }

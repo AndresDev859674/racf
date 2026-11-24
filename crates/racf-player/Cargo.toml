@@ -1,6 +1,6 @@
 [package]
 name = "racf-player"
-description = "Audio player and DSP engine for RACF files"
+description = "CLI audio player for RACF files"
 version.workspace = true
 edition.workspace = true
 license-file = "../../LICENSE"
@@ -9,6 +9,7 @@ license-file = "../../LICENSE"
 cpal.workspace = true
 crossterm = "0.28"
 racf-core = { path = "../racf-core" }
+racf-engine = { path = "../racf-engine" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 mpris-server = { version = "0.11", features = ["tokio"] }

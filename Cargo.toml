@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/racf-core", "crates/racf-player", "crates/racf-utils"]
+members = [
+    "crates/racf-core",
+    "crates/racf-engine",
+    "crates/racf-player",
+    "crates/racf-ffi",
+    "crates/racf-utils",
+]
 
 [workspace.package]
 version = "0.1.0"

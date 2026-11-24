@@ -16,10 +16,11 @@
 
 RACF is an audio format that applies the philosophy of SVG to sound: a score is
 a readable, declarative text document that describes instruments, notes, timing,
-mixing, and channel routing. `racf-player` turns that document into audio.
+mixing, and channel routing. `racf-engine` turns that document into PCM, and
+both `racf-player` and `racf-ffi` host that engine.
 
-The codebase is split into three crates so the format, the audio backend, and
-the tooling can evolve independently.
+The codebase is split into five crates so the format, the renderer, the audio
+backends, and the tooling can evolve independently.
 
 ## Workspace layout
 
@@ -28,14 +29,20 @@ crates/
   racf-core/     format model, XML parser, pitch/duration math,
                  channel layouts, instrument definitions, metadata,
                  lyrics, embedded audio, timeline compiler
-  racf-player/   DSP engines, realtime mixer, cpal output, MPRIS, CLI
+  racf-engine/   hardware-agnostic voices, embedded-audio playback, mixer,
+                 timeline cursor, seeking, pull-based f32 rendering
+  racf-player/   cpal output, terminal UI, MPRIS, CLI (uses racf-engine)
+  racf-ffi/      C ABI and generated racf.h for external players/engines
   racf-utils/    MP3/WAV/FLAC → .racf conversion, inspection, validation
 ```
 
 `racf-core` has no dependency on an audio device. It answers **what should
-sound, when, on which channel, and with what parameters**. `racf-player`
-answers **how to synthesize and route it**. `racf-utils` answers **how to get
-audio and data in and out of the format**.
+sound, when, on which channel, and with what parameters**. `racf-engine`
+answers **how to synthesize and render it into a caller-chosen sample rate and
+channel layout**, without knowing anything about devices, CLI flags, or D-Bus.
+`racf-player` adds the terminal device/transport, `racf-ffi` exposes the engine
+to C hosts, and `racf-utils` answers **how to get audio and data in and out of
+the format**.
 
 ### Core pipeline
 
@@ -47,16 +54,19 @@ Document { tempo, layout, metadata, lyrics, imports, instruments, tracks, audio_
    │  racf_core::compile_timeline
    ▼
 Timeline { ScheduledEvent { timestamp_ms, action } }
-   │  racf_player::play
+   │  racf_engine::RacfEngine
    ▼
-Voice / SampleVoice → MasterMixer → device channels
+Voice / SampleVoice → MasterMixer → interleaved f32 frames
+   │                         ├─ racf-player → cpal device
+   │                         └─ racf-ffi   → external host
 ```
 
 The compiler resolves `import::` presets, expands sequences/beats/chords, applies
 track gain, `force`, fades, note velocity, tempo changes, and `targetDuration`,
 then produces absolute-time `Play(NoteEvent)` events plus one `PlayAudio` event
-per embedded clip. The player constructs one voice per note (or sample clip) and
-mixes them in realtime.
+per embedded clip. The engine constructs one voice per note (or sample clip),
+advances its timeline cursor in sync with rendered frames, and mixes them in
+realtime.
 
 ## Running
 
@@ -81,6 +91,44 @@ The loading path for embedded audio is optimized for large documents.
 Resampling uses precomputed polyphase Lanczos kernels and renders output frames
 in parallel, so multi-megabyte MP3-derived RACF files load in roughly a second
 instead of several.
+
+## Embedding in C (or any audio host)
+
+`cargo build -p racf-ffi` produces `target/debug/libracf.so` /
+`target/debug/libracf.a` and automatically generates
+`crates/racf-ffi/include/racf.h` with cbindgen. The API is pull-based: the host
+chooses the sample rate and channel count when opening a document, then asks the
+engine for more interleaved `float` frames from its audio callback.
+
+```c
+#include <stdio.h>
+#include "racf.h"
+
+RacfEngine *engine = NULL;
+if (racf_open_file("song.racf", 48000, 2, &engine) != RACF_OK) {
+    fprintf(stderr, "%s\n", racf_last_error());
+}
+
+RacfInfo info;
+racf_get_info(engine, &info);
+
+float buffer[1024];                       /* 512 stereo frames */
+intptr_t frames = racf_read_f32(engine, buffer, 512);
+if (frames < 0) {
+    fprintf(stderr, "%s\n", racf_last_error());
+} else if (frames == 0) {
+    /* End of timeline (plus decay tail). */
+}
+
+racf_seek(engine, 30 * 1000);             /* milliseconds */
+racf_close(engine);                       /* required */
+```
+
+All entry points return `RACF_OK` or a negative status code and never let a
+Rust panic cross the ABI. `racf_last_error()` returns a thread-local,
+NUL-terminated message; it stays valid until the next API call on that thread.
+The engine buffers are self-contained, so several engines can be rendered from
+different threads at once.
 
 ## Metadata
 

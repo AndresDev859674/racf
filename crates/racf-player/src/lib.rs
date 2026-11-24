@@ -1,8 +1,9 @@
-//! Audio player and DSP engines for RACF.
+//! Audio player front-end for RACF.
 //!
-//! The player is intentionally separate from `racf-core`: core decides *what*
-//! should sound and *when*, while this crate decides *how* to synthesize and
-//! route it to the output device.
+//! Synthesis, timeline tracking, and PCM rendering live in the hardware-agnostic
+//! `racf-engine` crate. This crate adds the CLI transport (cpal output, terminal
+//! UI, MPRIS, and command parsing) and re-exports the engine types for
+//! compatibility with existing users.
 
 pub mod audio;
 pub mod control;
@@ -22,5 +23,6 @@ pub use eq::{EqPreset, GraphicEq};
 pub use error::PlayerError;
 pub use mixer::MasterMixer;
 pub use mpris::PlaybackStatus;
+pub use racf_engine::{EngineNotification, RacfEngine};
 pub use sample::{PreparedClip, SampleVoice};
 pub use voice::Voice;

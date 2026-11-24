@@ -1,0 +1,16 @@
+[package]
+name = "racf-ffi"
+description = "C ABI for rendering RACF documents from media players and engines"
+version.workspace = true
+edition.workspace = true
+license-file = "../../LICENSE"
+
+[lib]
+name = "racf"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+racf-engine = { path = "../racf-engine" }
+
+[build-dependencies]
+cbindgen = "0.29"

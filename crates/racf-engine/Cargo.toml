@@ -1,0 +1,9 @@
+[package]
+name = "racf-engine"
+description = "Hardware-agnostic RACF synthesis and pull-based rendering engine"
+version.workspace = true
+edition.workspace = true
+license-file = "../../LICENSE"
+
+[dependencies]
+racf-core = { path = "../racf-core" }

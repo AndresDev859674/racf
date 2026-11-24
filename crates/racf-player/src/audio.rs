@@ -1,3 +1,8 @@
+//! cpal output and interactive transport for a RACF document.
+//!
+//! All synthesis and timeline tracking is performed by `racf-engine`; this
+//! module only drives it from the audio callback and the terminal UI.
+
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -6,20 +11,19 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
-use racf_core::{Document, ScheduledAction, ScheduledEvent, Timeline};
+use racf_core::{Document, Timeline};
+use racf_engine::{EngineNotification, RacfEngine};
 
 use crate::control::{
     self, format_duration, Command, EqRequest, LoopAction, SeekRequest, StatusInfo, VolumeChange,
 };
 use crate::eq::{self, EqPreset};
 use crate::error::PlayerError;
-use crate::mixer::MasterMixer;
 use crate::mpris::{MprisHandle, PlaybackStatus};
 use crate::ui::{self, TerminalGuard, Ui, UiEvent};
 
 const EVENT_TICK: Duration = Duration::from_millis(5);
 const UI_TICK: Duration = Duration::from_millis(100);
-const TAIL_MS: u64 = 700;
 
 /// Initial playback settings controlled from the command line.
 #[derive(Clone, Debug)]
@@ -62,29 +66,33 @@ pub fn play(
         .map_err(|error| PlayerError::Audio(error.to_string()))?;
     let sample_format = supported.sample_format();
     let config: StreamConfig = supported.config();
-    let sample_rate = config.sample_rate.0 as f32;
+    let sample_rate = config.sample_rate.0;
     let device_channels = config.channels as usize;
 
-    let mixer = Arc::new(Mutex::new(MasterMixer::new(document, sample_rate)));
+    let engine = Arc::new(Mutex::new(
+        RacfEngine::from_document(document, sample_rate, device_channels as u16)
+            .map_err(|error| PlayerError::Engine(error.to_string()))?,
+    ));
     {
-        let mut guard = mixer.lock().unwrap();
+        let mut guard = engine.lock().unwrap();
         guard.set_master_volume_percent(options.volume_percent);
         if let Some(preset) = options.eq {
             guard.set_eq_preset(preset);
         }
+        guard.set_looping(options.looping);
     }
 
     let stream = match sample_format {
-        SampleFormat::F32 => build_stream::<f32>(&device, &config, Arc::clone(&mixer)),
-        SampleFormat::F64 => build_stream::<f64>(&device, &config, Arc::clone(&mixer)),
-        SampleFormat::I8 => build_stream::<i8>(&device, &config, Arc::clone(&mixer)),
-        SampleFormat::I16 => build_stream::<i16>(&device, &config, Arc::clone(&mixer)),
-        SampleFormat::I32 => build_stream::<i32>(&device, &config, Arc::clone(&mixer)),
-        SampleFormat::I64 => build_stream::<i64>(&device, &config, Arc::clone(&mixer)),
-        SampleFormat::U8 => build_stream::<u8>(&device, &config, Arc::clone(&mixer)),
-        SampleFormat::U16 => build_stream::<u16>(&device, &config, Arc::clone(&mixer)),
-        SampleFormat::U32 => build_stream::<u32>(&device, &config, Arc::clone(&mixer)),
-        SampleFormat::U64 => build_stream::<u64>(&device, &config, Arc::clone(&mixer)),
+        SampleFormat::F32 => build_stream::<f32>(&device, &config, Arc::clone(&engine)),
+        SampleFormat::F64 => build_stream::<f64>(&device, &config, Arc::clone(&engine)),
+        SampleFormat::I8 => build_stream::<i8>(&device, &config, Arc::clone(&engine)),
+        SampleFormat::I16 => build_stream::<i16>(&device, &config, Arc::clone(&engine)),
+        SampleFormat::I32 => build_stream::<i32>(&device, &config, Arc::clone(&engine)),
+        SampleFormat::I64 => build_stream::<i64>(&device, &config, Arc::clone(&engine)),
+        SampleFormat::U8 => build_stream::<u8>(&device, &config, Arc::clone(&engine)),
+        SampleFormat::U16 => build_stream::<u16>(&device, &config, Arc::clone(&engine)),
+        SampleFormat::U32 => build_stream::<u32>(&device, &config, Arc::clone(&engine)),
+        SampleFormat::U64 => build_stream::<u64>(&device, &config, Arc::clone(&engine)),
         other => {
             return Err(PlayerError::UnsupportedSampleFormat(format!("{other:?}")));
         }
@@ -101,7 +109,7 @@ pub fn play(
             .unwrap_or_else(|_| "unknown device".to_string()),
         config.sample_rate.0,
         device_channels,
-        mixer.lock().unwrap().layout()
+        engine.lock().unwrap().document().channel_layout
     );
 
     let mpris = crate::mpris::start(document, timeline, source, enable_mpris);
@@ -136,16 +144,10 @@ pub fn play(
     let transport = Transport {
         document,
         timeline,
-        mixer,
+        engine,
         mpris,
         ui: Ui::new(interactive),
         receiver,
-        cursor: 0,
-        base_ms: 0,
-        anchor: Instant::now(),
-        paused: false,
-        pause_position: 0,
-        looping: options.looping,
         next_ui: Instant::now(),
         title,
         interactive,
@@ -160,16 +162,10 @@ pub fn play(
 struct Transport<'a> {
     document: &'a Document,
     timeline: &'a Timeline,
-    mixer: Arc<Mutex<MasterMixer>>,
+    engine: Arc<Mutex<RacfEngine>>,
     mpris: MprisHandle,
     ui: Ui,
     receiver: Receiver<UiEvent>,
-    cursor: usize,
-    base_ms: u64,
-    anchor: Instant,
-    paused: bool,
-    pause_position: u64,
-    looping: bool,
     next_ui: Instant,
     title: String,
     interactive: bool,
@@ -203,30 +199,36 @@ impl<'a> Transport<'a> {
                 }
             }
 
-            let now = Instant::now();
-            let position = self.position();
-
-            if !self.paused {
-                while let Some(event) = self.timeline.events.get(self.cursor).cloned() {
-                    if event.timestamp_ms > position {
-                        break;
-                    }
-                    self.dispatch(&event)?;
-                    self.cursor += 1;
-                }
-
-                if position >= self.timeline.end_ms.saturating_add(TAIL_MS) {
-                    if self.looping && self.timeline.end_ms > 0 {
-                        self.seek_to(0);
-                    } else {
-                        self.finish("[RACF] Playback complete")?;
-                        return Ok(());
+            // Separation events are dispatched by the engine when their
+            // timestamp is reached; forward them to the status log here.
+            let notifications = self.engine.lock().unwrap().drain_notifications();
+            for notification in notifications {
+                match notification {
+                    EngineNotification::Separation { active, target } => {
+                        if active {
+                            self.ui.log(&format!(
+                                "[RACF] Stem separation on -> isolated: {target:?}"
+                            ))?;
+                        } else {
+                            self.ui
+                                .log("[RACF] Stem separation off -> normal mix restored")?;
+                        }
                     }
                 }
             }
 
+            let (position, finished) = {
+                let engine = self.engine.lock().unwrap();
+                (engine.position_ms(), engine.is_finished())
+            };
+
+            if finished {
+                self.finish("[RACF] Playback complete")?;
+                return Ok(());
+            }
+
+            let now = Instant::now();
             if now >= self.next_ui {
-                let position = self.position();
                 self.mpris.set_position(position.min(self.timeline.end_ms));
                 let status = self.status_line(position);
                 let lyrics = self.lyrics_lines(position);
@@ -239,111 +241,24 @@ impl<'a> Transport<'a> {
     }
 
     fn position(&self) -> u64 {
-        if self.paused {
-            self.pause_position
-        } else {
-            self.base_ms
-                .saturating_add(self.anchor.elapsed().as_millis() as u64)
-        }
-    }
-
-    fn dispatch(&mut self, event: &ScheduledEvent) -> Result<(), PlayerError> {
-        match &event.action {
-            ScheduledAction::Play(note) => {
-                self.mixer.lock().unwrap().push_note(note);
-            }
-            ScheduledAction::PlayAudio(audio) => {
-                self.mixer.lock().unwrap().push_audio(audio);
-            }
-            ScheduledAction::SetSeparation { active, target } => {
-                self.mixer
-                    .lock()
-                    .unwrap()
-                    .set_separation(*active, target.clone());
-                if *active {
-                    self.ui.log(&format!(
-                        "[RACF] Stem separation on -> isolated: {target:?}"
-                    ))?;
-                } else {
-                    self.ui
-                        .log("[RACF] Stem separation off -> normal mix restored")?;
-                }
-            }
-        }
-
-        Ok(())
+        self.engine.lock().unwrap().position_ms()
     }
 
     fn seek_to(&mut self, target_ms: u64) {
-        let target = target_ms.min(self.timeline.end_ms);
-        let mut separation = (false, None);
-
-        {
-            let mut mixer = self.mixer.lock().unwrap();
-            mixer.reset();
-
-            for event in &self.timeline.events {
-                if event.timestamp_ms > target {
-                    break;
-                }
-
-                match &event.action {
-                    ScheduledAction::Play(note) => {
-                        let duration_ms = (note.duration_secs.max(0.0) * 1_000.0).round() as u64;
-                        if target < event.timestamp_ms.saturating_add(duration_ms) {
-                            let offset = target.saturating_sub(event.timestamp_ms) as f32 / 1_000.0;
-                            mixer.push_note_at(note, offset);
-                        }
-                    }
-                    ScheduledAction::PlayAudio(audio) => {
-                        let duration_ms = self
-                            .document
-                            .audio_clips
-                            .get(audio.clip_index)
-                            .map(|clip| clip.duration_ms())
-                            .unwrap_or(0);
-                        if target < event.timestamp_ms.saturating_add(duration_ms) {
-                            let offset = target.saturating_sub(event.timestamp_ms) as f32 / 1_000.0;
-                            mixer.push_audio_at(audio, offset);
-                        }
-                    }
-                    ScheduledAction::SetSeparation { active, target } => {
-                        separation = (*active, target.clone());
-                    }
-                }
-            }
-
-            mixer.set_separation(separation.0, separation.1);
-        }
-
-        self.cursor = self
-            .timeline
-            .events
-            .partition_point(|event| event.timestamp_ms <= target);
-        self.base_ms = target;
-        self.anchor = Instant::now();
-        if self.paused {
-            self.pause_position = target;
-        }
+        self.engine.lock().unwrap().seek(target_ms);
     }
 
     fn set_paused(&mut self, paused: bool) {
-        if paused == self.paused {
+        if paused == self.engine.lock().unwrap().is_paused() {
             return;
         }
 
-        if paused {
-            self.pause_position = self.position();
-            self.paused = true;
-            self.mixer.lock().unwrap().set_paused(true);
-            self.mpris.set_status(PlaybackStatus::Paused);
+        self.engine.lock().unwrap().set_paused(paused);
+        self.mpris.set_status(if paused {
+            PlaybackStatus::Paused
         } else {
-            self.base_ms = self.pause_position;
-            self.anchor = Instant::now();
-            self.paused = false;
-            self.mixer.lock().unwrap().set_paused(false);
-            self.mpris.set_status(PlaybackStatus::Playing);
-        }
+            PlaybackStatus::Playing
+        });
     }
 
     fn handle_command(&mut self, line: &str) -> Result<bool, PlayerError> {
@@ -356,19 +271,19 @@ impl<'a> Transport<'a> {
                 self.ui.log(&report)?;
             }
             Ok(Command::Volume(None)) => {
-                let volume = self.mixer.lock().unwrap().master_volume_percent();
+                let volume = self.engine.lock().unwrap().master_volume_percent();
                 self.ui.log(&format!("[RACF] volume: {volume:.0}%"))?;
             }
             Ok(Command::Volume(Some(change))) => {
                 let volume = {
-                    let mut mixer = self.mixer.lock().unwrap();
-                    let current = mixer.master_volume_percent();
+                    let mut engine = self.engine.lock().unwrap();
+                    let current = engine.master_volume_percent();
                     let target = match change {
                         VolumeChange::Set(value) => value,
                         VolumeChange::Delta(delta) => current + delta,
                     }
                     .clamp(0.0, 200.0);
-                    mixer.set_master_volume_percent(target);
+                    engine.set_master_volume_percent(target);
                     target
                 };
                 self.ui.log(&format!("[RACF] volume: {volume:.0}%"))?;
@@ -398,7 +313,7 @@ impl<'a> Transport<'a> {
                 self.ui.log("[RACF] playing")?;
             }
             Ok(Command::TogglePause) => {
-                let paused = !self.paused;
+                let paused = !self.engine.lock().unwrap().is_paused();
                 self.set_paused(paused);
                 self.ui.log(if paused {
                     "[RACF] paused"
@@ -408,8 +323,8 @@ impl<'a> Transport<'a> {
             }
             Ok(Command::Eq(EqRequest::Show)) => {
                 let (label, gains) = {
-                    let mixer = self.mixer.lock().unwrap();
-                    (mixer.eq_label(), mixer.eq_gains())
+                    let engine = self.engine.lock().unwrap();
+                    (engine.eq_label(), engine.eq_gains())
                 };
                 let bands = eq::BAND_LABELS
                     .iter()
@@ -420,17 +335,17 @@ impl<'a> Transport<'a> {
                 self.ui.log(&format!("[RACF] eq {label} | {bands}"))?;
             }
             Ok(Command::Eq(EqRequest::Off)) => {
-                self.mixer.lock().unwrap().disable_eq();
+                self.engine.lock().unwrap().disable_eq();
                 self.ui.log("[RACF] eq off")?;
             }
             Ok(Command::Eq(EqRequest::Preset(preset))) => {
-                self.mixer.lock().unwrap().set_eq_preset(preset);
+                self.engine.lock().unwrap().set_eq_preset(preset);
                 self.ui
                     .log(&format!("[RACF] eq preset: {}", preset.name()))?;
             }
             Ok(Command::Eq(EqRequest::Band { index, gain_db })) => {
                 if self
-                    .mixer
+                    .engine
                     .lock()
                     .unwrap()
                     .set_eq_band_gain(index, gain_db as f32)
@@ -443,20 +358,22 @@ impl<'a> Transport<'a> {
                 }
             }
             Ok(Command::Loop(None)) => {
+                let looping = self.engine.lock().unwrap().is_looping();
                 self.ui.log(&format!(
                     "[RACF] loop: {}",
-                    if self.looping { "on" } else { "off" }
+                    if looping { "on" } else { "off" }
                 ))?;
             }
             Ok(Command::Loop(Some(action))) => {
-                self.looping = match action {
+                let looping = match action {
                     LoopAction::On => true,
                     LoopAction::Off => false,
-                    LoopAction::Toggle => !self.looping,
+                    LoopAction::Toggle => !self.engine.lock().unwrap().is_looping(),
                 };
+                self.engine.lock().unwrap().set_looping(looping);
                 self.ui.log(&format!(
                     "[RACF] loop: {}",
-                    if self.looping { "on" } else { "off" }
+                    if looping { "on" } else { "off" }
                 ))?;
             }
         }
@@ -466,17 +383,17 @@ impl<'a> Transport<'a> {
 
     fn status_line(&self, position: u64) -> String {
         let (volume, eq_label) = {
-            let mixer = self.mixer.lock().unwrap();
-            (mixer.master_volume_percent(), mixer.eq_label())
+            let engine = self.engine.lock().unwrap();
+            (engine.master_volume_percent(), engine.eq_label())
         };
 
         control::status_line(&StatusInfo {
             position_ms: position,
             duration_ms: self.timeline.end_ms,
-            paused: self.paused,
+            paused: self.engine.lock().unwrap().is_paused(),
             volume_percent: volume,
             eq_label: &eq_label,
-            looping: self.looping,
+            looping: self.engine.lock().unwrap().is_looping(),
         })
     }
 
@@ -514,9 +431,9 @@ impl<'a> Transport<'a> {
 
     fn status_report(&self) -> String {
         let position = self.position();
-        let (label, gains) = {
-            let mixer = self.mixer.lock().unwrap();
-            (mixer.eq_label(), mixer.eq_gains())
+        let (paused, label, gains) = {
+            let engine = self.engine.lock().unwrap();
+            (engine.is_paused(), engine.eq_label(), engine.eq_gains())
         };
         let bands = eq::BAND_LABELS
             .iter()
@@ -525,16 +442,24 @@ impl<'a> Transport<'a> {
             .collect::<Vec<_>>()
             .join("  ");
 
+        let status = control::status_line(&StatusInfo {
+            position_ms: position,
+            duration_ms: self.timeline.end_ms,
+            paused,
+            volume_percent: self.engine.lock().unwrap().master_volume_percent(),
+            eq_label: &label,
+            looping: self.engine.lock().unwrap().is_looping(),
+        });
+
         format!(
             "[RACF] {}\n{}\n[RACF] EQ {label}: {bands}",
-            self.title,
-            self.status_line(position),
+            self.title, status
         )
     }
 
     fn finish(&mut self, message: &str) -> Result<(), PlayerError> {
         self.mpris.stop();
-        self.mixer.lock().unwrap().set_paused(true);
+        self.engine.lock().unwrap().set_paused(true);
         self.ui.log(message)?;
         self.ui.finish()?;
         Ok(())
@@ -550,12 +475,11 @@ impl Drop for Transport<'_> {
 fn build_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
-    mixer: Arc<Mutex<MasterMixer>>,
+    engine: Arc<Mutex<RacfEngine>>,
 ) -> Result<cpal::Stream, PlayerError>
 where
     T: SizedSample + FromSample<f32>,
 {
-    let channels = config.channels as usize;
     let mut scratch = Vec::<f32>::new();
 
     device
@@ -566,7 +490,7 @@ where
                     scratch.resize(data.len(), 0.0);
                 }
 
-                mixer.lock().unwrap().render(&mut scratch, channels);
+                engine.lock().unwrap().render_f32(&mut scratch);
 
                 for (output, sample) in data.iter_mut().zip(scratch.iter()) {
                     *output = T::from_sample(*sample);

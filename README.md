@@ -1,9 +1,6 @@
-
-<p align="center">
-  <img src="https://codeberg.org/racf/source/raw/branch/main/assets/logo.png" width="480" alt="RACF">
-</p>
-
 <div align="center">
+
+<img src="https://codeberg.org/racf/source/raw/branch/main/assets/logo.png" width="480" alt="RACF">
 
 # RACF — Readable Audio Code Factor
 ### MIDI is great, but it needs more

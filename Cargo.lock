@@ -978,6 +978,7 @@ name = "racf-ffi"
 version = "0.1.0"
 dependencies = [
  "cbindgen",
+ "racf-core",
  "racf-engine",
 ]
 

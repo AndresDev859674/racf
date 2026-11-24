@@ -10,6 +10,7 @@ name = "racf"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
+racf-core = { path = "../racf-core" }
 racf-engine = { path = "../racf-engine" }
 
 [build-dependencies]

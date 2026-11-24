@@ -3,7 +3,7 @@ use std::sync::Arc;
 use racf_core::{AudioEvent, Channel, ChannelLayout, Document, NoteEvent};
 
 use crate::eq::{EqPreset, GraphicEq};
-use crate::sample::{PreparedClip, SampleVoice};
+use crate::sample::{PreparedClip, ResamplerCache, SampleVoice};
 use crate::voice::Voice;
 
 /// Real-time renderer. The audio callback owns the only mutable access to the
@@ -37,10 +37,11 @@ impl MasterMixer {
     pub fn new(document: &Document, sample_rate: f32, channels: usize) -> Self {
         let channel_count = document.channel_layout.len();
 
+        let mut resamplers = ResamplerCache::default();
         let clips = document
             .audio_clips
             .iter()
-            .map(|clip| Arc::new(PreparedClip::new(clip, sample_rate)))
+            .map(|clip| Arc::new(PreparedClip::with_cache(clip, sample_rate, &mut resamplers)))
             .collect();
 
         Self {

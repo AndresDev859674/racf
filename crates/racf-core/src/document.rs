@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::Path;
 
 use roxmltree::{Document as XmlDocument, Node};
 
@@ -9,6 +12,19 @@ use crate::error::RacfError;
 use crate::instrument::{DrumType, InstrumentDef, InstrumentKind, VocalParams, Waveform};
 use crate::lyrics::{parse_lyrics, Lyrics};
 use crate::metadata::{parse_metadata, Metadata};
+
+/// Reads a RACF file into a pre-sized string.
+///
+/// `fs::read_to_string` grows its buffer geometrically, which briefly needs
+/// almost twice the file size for large embedded clips. Reserving the exact
+/// file length up front keeps the parse peak close to the file size.
+pub fn read_document_file(path: impl AsRef<Path>) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let capacity = usize::try_from(file.metadata()?.len()).unwrap_or(0);
+    let mut source = String::with_capacity(capacity);
+    file.read_to_string(&mut source)?;
+    Ok(source)
+}
 
 pub const DEFAULT_TEMPO: f32 = 128.0;
 pub const DEFAULT_BIT_DEPTH: u8 = 16;

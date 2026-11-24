@@ -109,7 +109,7 @@ pub fn play(
             .unwrap_or_else(|_| "unknown device".to_string()),
         config.sample_rate.0,
         device_channels,
-        engine.lock().unwrap().document().channel_layout
+        engine.lock().unwrap().layout()
     );
 
     let mpris = crate::mpris::start(document, timeline, source, enable_mpris);
@@ -382,18 +382,25 @@ impl<'a> Transport<'a> {
     }
 
     fn status_line(&self, position: u64) -> String {
-        let (volume, eq_label) = {
+        // One lock for every field. Taking the mutex again while a guard from
+        // an earlier field expression is still alive would deadlock.
+        let (volume, eq_label, paused, looping) = {
             let engine = self.engine.lock().unwrap();
-            (engine.master_volume_percent(), engine.eq_label())
+            (
+                engine.master_volume_percent(),
+                engine.eq_label(),
+                engine.is_paused(),
+                engine.is_looping(),
+            )
         };
 
         control::status_line(&StatusInfo {
             position_ms: position,
             duration_ms: self.timeline.end_ms,
-            paused: self.engine.lock().unwrap().is_paused(),
+            paused,
             volume_percent: volume,
             eq_label: &eq_label,
-            looping: self.engine.lock().unwrap().is_looping(),
+            looping,
         })
     }
 
@@ -431,9 +438,15 @@ impl<'a> Transport<'a> {
 
     fn status_report(&self) -> String {
         let position = self.position();
-        let (paused, label, gains) = {
+        let (paused, label, gains, volume, looping) = {
             let engine = self.engine.lock().unwrap();
-            (engine.is_paused(), engine.eq_label(), engine.eq_gains())
+            (
+                engine.is_paused(),
+                engine.eq_label(),
+                engine.eq_gains(),
+                engine.master_volume_percent(),
+                engine.is_looping(),
+            )
         };
         let bands = eq::BAND_LABELS
             .iter()
@@ -446,9 +459,9 @@ impl<'a> Transport<'a> {
             position_ms: position,
             duration_ms: self.timeline.end_ms,
             paused,
-            volume_percent: self.engine.lock().unwrap().master_volume_percent(),
+            volume_percent: volume,
             eq_label: &label,
-            looping: self.engine.lock().unwrap().is_looping(),
+            looping,
         });
 
         format!(
@@ -500,4 +513,42 @@ where
             None,
         )
         .map_err(|error| PlayerError::Audio(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use racf_core::{compile_timeline, parse_document};
+
+    #[test]
+    fn status_helpers_take_the_engine_lock_once() {
+        let document = parse_document(
+            r#"<racf tempo="60"><score><track instrument="x"><note pitch="C4" duration="1/1" /></track></score></racf>"#,
+        )
+        .unwrap();
+        let timeline = compile_timeline(&document);
+        let engine = Arc::new(Mutex::new(
+            RacfEngine::from_document(&document, 1_000, 1).unwrap(),
+        ));
+        let mpris = crate::mpris::start(&document, &timeline, Path::new("test.racf"), false);
+        let (_sender, receiver) = mpsc::channel();
+
+        let transport = Transport {
+            document: &document,
+            timeline: &timeline,
+            engine,
+            mpris,
+            ui: Ui::new(false),
+            receiver,
+            next_ui: Instant::now(),
+            title: "test".to_string(),
+            interactive: false,
+            _terminal: None,
+        };
+
+        // The old implementation locked the same Mutex again while a guard
+        // from the status struct literal was still alive, hanging the player.
+        assert!(transport.status_line(0).contains("playing"));
+        assert!(transport.status_report().contains("playing"));
+    }
 }

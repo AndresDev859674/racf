@@ -20,9 +20,9 @@ pub mod timeline;
 pub use audio::{decode_mulaw, AudioClip, SampleEncoding};
 pub use channel::{Channel, ChannelLayout};
 pub use document::{
-    parse_document, BeatSpec, BeatStep, ChordSpec, Document, Import, LyricSpec, NoteSpec, RestSpec,
-    SequenceSpec, TimeSignature, Track, TrackItem, DEFAULT_BITRATE_KBPS, DEFAULT_BIT_DEPTH,
-    DEFAULT_TEMPO,
+    parse_document, read_document_file, BeatSpec, BeatStep, ChordSpec, Document, Import, LyricSpec,
+    NoteSpec, RestSpec, SequenceSpec, TimeSignature, Track, TrackItem, DEFAULT_BITRATE_KBPS,
+    DEFAULT_BIT_DEPTH, DEFAULT_TEMPO,
 };
 pub use duration::{beats_to_ms, parse_duration, parse_target_duration, parse_time_ms};
 pub use error::RacfError;

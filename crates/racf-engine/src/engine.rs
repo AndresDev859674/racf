@@ -3,7 +3,10 @@
 use std::error::Error;
 use std::fmt;
 
-use racf_core::{compile_timeline, parse_document, Document, RacfError, ScheduledAction, Timeline};
+use racf_core::{
+    compile_timeline, parse_document, ChannelLayout, Document, Metadata, RacfError,
+    ScheduledAction, Timeline,
+};
 
 use crate::eq::EqPreset;
 use crate::mixer::MasterMixer;
@@ -50,7 +53,9 @@ pub enum EngineNotification {
 /// The engine advances its own timeline cursor in locks-step with the rendered
 /// samples, so callers only need to keep pulling [`RacfEngine::render_f32`].
 pub struct RacfEngine {
-    document: Document,
+    metadata: Metadata,
+    layout: ChannelLayout,
+    audio_durations_ms: Vec<u64>,
     timeline: Timeline,
     mixer: MasterMixer,
     sample_rate: u32,
@@ -74,15 +79,20 @@ impl RacfEngine {
         sample_rate: u32,
         channels: u16,
     ) -> Result<Self, EngineError> {
-        Self::from_owned_document(document.clone(), sample_rate, channels)
+        Self::build(document, sample_rate, channels)
     }
 
-    /// Like [`Self::from_document`], without cloning the document.
+    /// Like [`Self::from_document`], but lets the caller drop the document as
+    /// soon as the engine is built.
     pub fn from_owned_document(
         document: Document,
         sample_rate: u32,
         channels: u16,
     ) -> Result<Self, EngineError> {
+        Self::build(&document, sample_rate, channels)
+    }
+
+    fn build(document: &Document, sample_rate: u32, channels: u16) -> Result<Self, EngineError> {
         if sample_rate == 0 {
             return Err(EngineError::InvalidSampleRate(sample_rate));
         }
@@ -90,11 +100,24 @@ impl RacfEngine {
             return Err(EngineError::InvalidChannels(channels));
         }
 
-        let timeline = compile_timeline(&document);
-        let mixer = MasterMixer::new(&document, sample_rate as f32, channels as usize);
+        let timeline = compile_timeline(document);
+        let mixer = MasterMixer::new(document, sample_rate as f32, channels as usize);
+
+        // Keep only the small pieces the host may query later. Retaining the
+        // whole `Document` would duplicate embedded audio bytes (and every
+        // string in the score) for the lifetime of playback.
+        let metadata = document.metadata.clone();
+        let layout = document.channel_layout.clone();
+        let audio_durations_ms = document
+            .audio_clips
+            .iter()
+            .map(|clip| clip.duration_ms())
+            .collect();
 
         Ok(Self {
-            document,
+            metadata,
+            layout,
+            audio_durations_ms,
             timeline,
             mixer,
             sample_rate,
@@ -196,10 +219,9 @@ impl RacfEngine {
                 }
                 ScheduledAction::PlayAudio(audio) => {
                     let duration_ms = self
-                        .document
-                        .audio_clips
+                        .audio_durations_ms
                         .get(audio.clip_index)
-                        .map(|clip| clip.duration_ms())
+                        .copied()
                         .unwrap_or(0);
                     if target < event.timestamp_ms.saturating_add(duration_ms) {
                         let offset = (target - event.timestamp_ms) as f32 / 1_000.0;
@@ -245,8 +267,12 @@ impl RacfEngine {
         self.channels
     }
 
-    pub fn document(&self) -> &Document {
-        &self.document
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    pub fn layout(&self) -> &ChannelLayout {
+        &self.layout
     }
 
     pub fn timeline(&self) -> &Timeline {

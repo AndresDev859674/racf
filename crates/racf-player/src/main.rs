@@ -1,8 +1,7 @@
 use std::env;
-use std::fs;
 use std::path::PathBuf;
 
-use racf_core::{compile_timeline, parse_document, ScheduledAction};
+use racf_core::{compile_timeline, parse_document, read_document_file, ScheduledAction};
 use racf_player::{EqPreset, PlaybackOptions};
 
 fn main() {
@@ -60,8 +59,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    let source = fs::read_to_string(&path)?;
+    let source = read_document_file(&path)?;
     let document = parse_document(&source)?;
+    // `Document` owns everything it needs; the XML text is often larger than
+    // the decoded audio itself and must not stay resident during playback.
+    drop(source);
     let timeline = compile_timeline(&document);
 
     for line in racf_player::report::render(&path.display().to_string(), &document, &timeline) {

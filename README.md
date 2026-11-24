@@ -87,10 +87,11 @@ Playback starts at `--volume 100`; `--eq` accepts `flat`, `bass`, `vocal`,
 interactive status line also accepts commands (`:` opens the prompt) for
 volume, seeking, pause/resume, EQ bands, looping, and status.
 
-The loading path for embedded audio is optimized for large documents.
-Resampling uses precomputed polyphase Lanczos kernels and renders output frames
-in parallel, so multi-megabyte MP3-derived RACF files load in roughly a second
-instead of several.
+The loading path for embedded audio is optimized for large documents. Encoded
+clip bytes are shared between the parsed document and the engine, base64 text is
+decoded in chunks without an extra full-size copy, and frames are decoded and
+resampled lazily with shared polyphase Lanczos kernels. Resident memory tracks
+the compressed file size instead of the rendered PCM duration.
 
 ## Embedding in C (or any audio host)
 

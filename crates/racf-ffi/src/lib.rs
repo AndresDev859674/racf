@@ -12,6 +12,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::panic::{self, AssertUnwindSafe};
 
+use racf_core::read_document_file;
 use racf_engine::{EngineError, RacfEngine as CoreEngine};
 
 /// Operation completed successfully.
@@ -202,7 +203,7 @@ pub unsafe extern "C" fn racf_open_file(
         }
 
         let path = path_from_cstr(CStr::from_ptr(path));
-        let xml = match std::fs::read_to_string(&path) {
+        let xml = match read_document_file(&path) {
             Ok(xml) => xml,
             Err(error) => {
                 return fail(
@@ -270,7 +271,7 @@ pub unsafe extern "C" fn racf_get_info(engine: *const RacfEngine, out_info: *mut
 
         let handle = &*(engine.cast::<EngineHandle>());
         let source = &handle.engine;
-        let metadata = &source.document().metadata;
+        let metadata = source.metadata();
         let info = RacfInfo {
             duration_ms: source.duration_ms(),
             sample_rate: source.sample_rate(),

@@ -141,7 +141,7 @@ mod tests {
         assert_eq!(document.metadata.title.as_deref(), Some("A & B"));
         assert_eq!(document.metadata.description.as_deref(), Some("A < B"));
         assert_eq!(document.audio_clips.len(), 1);
-        assert_eq!(document.audio_clips[0].data, data);
+        assert_eq!(&document.audio_clips[0].data[..], data.as_slice());
         assert!((document.audio_clips[0].duration_secs() - 0.01).abs() < 0.0001);
     }
 

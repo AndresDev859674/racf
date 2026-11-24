@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 use base64::Engine as _;
 use roxmltree::Node;
@@ -71,7 +72,8 @@ pub struct AudioClip {
     pub sample_rate: u32,
     pub channels: u8,
     pub encoding: SampleEncoding,
-    pub data: Vec<u8>,
+    /// Encoded bytes, shared between the document and every prepared voice.
+    pub data: Arc<[u8]>,
 }
 
 impl AudioClip {
@@ -89,6 +91,51 @@ impl AudioClip {
 
     pub fn duration_ms(&self) -> u64 {
         (self.duration_secs() * 1000.0).round() as u64
+    }
+
+    /// Decodes one interleaved frame into `out` (up to `channels` samples).
+    ///
+    /// This lets playback decode source frames lazily instead of materializing
+    /// an entire clip as `f32` before the first sample is heard.
+    pub fn decode_frame(&self, frame: usize, out: &mut [f32]) {
+        let frame_bytes = self.channels as usize * self.encoding.bytes_per_sample();
+        let start = frame * frame_bytes;
+        let count = out.len().min(self.channels as usize);
+        let out = &mut out[..count];
+
+        match self.encoding {
+            SampleEncoding::Mulaw => {
+                for (sample, byte) in out.iter_mut().zip(
+                    self.data
+                        .get(start..)
+                        .unwrap_or_default()
+                        .iter()
+                        .take(count),
+                ) {
+                    *sample = decode_mulaw(*byte);
+                }
+            }
+            SampleEncoding::PcmU8 => {
+                for (sample, byte) in out.iter_mut().zip(
+                    self.data
+                        .get(start..)
+                        .unwrap_or_default()
+                        .iter()
+                        .take(count),
+                ) {
+                    *sample = (*byte as f32 - 128.0) / 128.0;
+                }
+            }
+            SampleEncoding::PcmI16Le => {
+                let bytes = self.data.get(start..).unwrap_or_default();
+                for (sample, pair) in out
+                    .iter_mut()
+                    .zip(bytes.as_chunks::<2>().0.iter().take(count))
+                {
+                    *sample = i16::from_le_bytes(*pair) as f32 / 32768.0;
+                }
+            }
+        }
     }
 
     /// Decodes the clip into interleaved `f32` samples in the range `-1.0..=1.0`.
@@ -125,6 +172,71 @@ pub fn decode_mulaw(byte: u8) -> f32 {
     };
 
     (sample as f32 / 32768.0).clamp(-1.0, 1.0)
+}
+
+/// Decodes base64 text without materializing a whitespace-free copy.
+///
+/// RACF files usually wrap `<data>` into short lines. Copying those lines into
+/// one big `String` before decoding briefly doubles the memory needed for the
+/// base64 payload, so we filter and decode in fixed-size chunks instead.
+fn decode_base64_texts(texts: &[&str], clip: &str) -> Result<Vec<u8>, RacfError> {
+    let invalid = |message: String| RacfError::InvalidAudio {
+        clip: clip.to_string(),
+        message,
+    };
+
+    if texts.len() == 1 && !texts[0].bytes().any(|b| b.is_ascii_whitespace()) {
+        return base64::engine::general_purpose::STANDARD
+            .decode(texts[0].as_bytes())
+            .map_err(|error| invalid(format!("invalid base64 data: {error}")));
+    }
+
+    let encoded_len = texts
+        .iter()
+        .map(|text| {
+            text.bytes()
+                .filter(|byte| !byte.is_ascii_whitespace())
+                .count()
+        })
+        .sum::<usize>();
+    if encoded_len == 0 {
+        return Err(invalid("<data> is empty".to_string()));
+    }
+
+    let mut data = Vec::with_capacity(base64::decoded_len_estimate(encoded_len));
+    let mut chunk = [0u8; 4096];
+    let mut used = 0;
+
+    let append = |bytes: &[u8], data: &mut Vec<u8>| -> Result<(), RacfError> {
+        let start = data.len();
+        data.resize(start + base64::decoded_len_estimate(bytes.len()), 0);
+        match base64::engine::general_purpose::STANDARD.decode_slice(bytes, &mut data[start..]) {
+            Ok(written) => {
+                data.truncate(start + written);
+                Ok(())
+            }
+            Err(error) => Err(invalid(format!("invalid base64 data: {error}"))),
+        }
+    };
+
+    for text in texts {
+        for byte in text.bytes() {
+            if byte.is_ascii_whitespace() {
+                continue;
+            }
+            chunk[used] = byte;
+            used += 1;
+            if used == chunk.len() {
+                append(&chunk, &mut data)?;
+                used = 0;
+            }
+        }
+    }
+    if used > 0 {
+        append(&chunk[..used], &mut data)?;
+    }
+
+    Ok(data)
 }
 
 pub(crate) fn parse_audio(root: Node<'_, '_>) -> Result<Vec<AudioClip>, RacfError> {
@@ -188,27 +300,20 @@ pub(crate) fn parse_audio(root: Node<'_, '_>) -> Result<Vec<AudioClip>, RacfErro
                 message: "missing <data> element".to_string(),
             })?;
 
-        let encoded: String = data_node
+        let text_nodes: Vec<&str> = data_node
             .descendants()
             .filter(|child| child.is_text())
             .filter_map(|child| child.text())
-            .flat_map(str::chars)
-            .filter(|character| !character.is_whitespace())
             .collect();
 
-        if encoded.is_empty() {
+        let data = decode_base64_texts(&text_nodes, &id)?;
+
+        if data.is_empty() {
             return Err(RacfError::InvalidAudio {
                 clip: id.clone(),
                 message: "<data> is empty".to_string(),
             });
         }
-
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|error| RacfError::InvalidAudio {
-                clip: id.clone(),
-                message: format!("invalid base64 data: {error}"),
-            })?;
 
         let frame_bytes = channels as usize * encoding.bytes_per_sample();
         if data.len() % frame_bytes != 0 {
@@ -237,7 +342,7 @@ pub(crate) fn parse_audio(root: Node<'_, '_>) -> Result<Vec<AudioClip>, RacfErro
             sample_rate,
             channels,
             encoding,
-            data,
+            data: Arc::from(data),
         });
     }
 

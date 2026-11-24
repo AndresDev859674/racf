@@ -1,44 +1,162 @@
+use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
-use racf_core::{AudioClip, Channel, ChannelLayout};
+use racf_core::{AudioClip, Channel, ChannelLayout, SampleEncoding};
 
-/// An embedded clip decoded and resampled to the output device rate.
+const MAX_CHANNELS: usize = 8;
+
+/// An embedded clip whose encoded bytes stay shared and are decoded on demand.
+///
+/// Keeping the compressed data instead of an eagerly resampled `Vec<f32>` is
+/// what makes long embedded clips cheap: memory use follows the file size, not
+/// the rendered duration.
 #[derive(Clone, Debug)]
 pub struct PreparedClip {
     pub id: String,
-    /// Interleaved frames at the device sample rate.
-    pub samples: Vec<f32>,
+    /// Number of interleaved source channels in each frame.
     pub channels: usize,
+    /// Output sample rate, exposed for callers that need frame arithmetic.
     pub sample_rate: f32,
+    data: Arc<[u8]>,
+    encoding: SampleEncoding,
+    source_frames: usize,
+    source_rate: f64,
+    frames: usize,
+    passthrough: bool,
+    kernel: Option<Arc<PolyphaseKernel>>,
 }
 
 impl PreparedClip {
     pub fn new(clip: &AudioClip, device_rate: f32) -> Self {
-        let decoded = clip.decode_frames();
-        let channels = clip.channels as usize;
-        let samples = resample(
-            &decoded,
-            clip.sample_rate as f64,
-            device_rate as f64,
-            channels,
-        );
+        let mut cache = ResamplerCache::default();
+        Self::with_cache(clip, device_rate, &mut cache)
+    }
+
+    /// Shares resampling kernels between clips with the same source/destination
+    /// rate pair instead of allocating one weight table per clip.
+    pub(crate) fn with_cache(
+        clip: &AudioClip,
+        device_rate: f32,
+        cache: &mut ResamplerCache,
+    ) -> Self {
+        let source_frames = clip.frames();
+        let source_rate = clip.sample_rate as f64;
+        let target_rate = device_rate as f64;
+        let valid_rates = source_rate > 0.0 && target_rate > 0.0;
+        let passthrough = !valid_rates || (source_rate - target_rate).abs() < 0.5;
+
+        let frames = if source_frames == 0 || !valid_rates {
+            0
+        } else if passthrough {
+            source_frames
+        } else {
+            ((source_frames as f64 * target_rate / source_rate).round() as usize).max(1)
+        };
+
+        let kernel = if passthrough {
+            None
+        } else {
+            Some(cache.get(source_rate, target_rate))
+        };
 
         Self {
             id: clip.id.clone(),
-            samples,
-            channels,
+            data: Arc::clone(&clip.data),
+            encoding: clip.encoding,
+            source_frames,
+            channels: clip.channels as usize,
             sample_rate: device_rate,
+            source_rate,
+            frames,
+            passthrough,
+            kernel,
         }
     }
 
     pub fn frames(&self) -> usize {
-        self.samples.len().checked_div(self.channels).unwrap_or(0)
+        self.frames
     }
 
     /// Frame index for a playback offset. The result is clamped to the clip.
     pub fn frame_at(&self, offset_secs: f32) -> usize {
         let frame = (offset_secs.max(0.0) * self.sample_rate).round() as usize;
-        frame.min(self.frames())
+        frame.min(self.frames)
+    }
+
+    /// Decodes and resamples one output frame into `out`.
+    fn render_frame(&self, frame: usize, out: &mut [f32; MAX_CHANNELS]) {
+        for sample in out.iter_mut().take(self.channels) {
+            *sample = 0.0;
+        }
+        if frame >= self.frames || self.source_frames == 0 {
+            return;
+        }
+
+        if self.passthrough {
+            self.decode_into(frame.min(self.source_frames - 1), out);
+            return;
+        }
+
+        let kernel = self
+            .kernel
+            .as_deref()
+            .expect("non-passthrough clips have a resampling kernel");
+        let step = self.source_rate / self.sample_rate as f64;
+        let center = frame as f64 * step;
+        let base = center.floor() as isize;
+        let fraction = (center - base as f64) as f32;
+        let phase = (fraction * PHASES as f32) as usize;
+        let mut decoded = [0.0f32; MAX_CHANNELS];
+
+        for (tap, weight) in kernel.phase_weights(phase).iter().enumerate() {
+            let source = (base + kernel.first_offset + tap as isize)
+                .clamp(0, self.source_frames as isize - 1) as usize;
+            self.decode_into(source, &mut decoded);
+            for (sample, value) in out
+                .iter_mut()
+                .take(self.channels)
+                .zip(decoded.iter().take(self.channels))
+            {
+                *sample += *value * weight;
+            }
+        }
+    }
+
+    fn decode_into(&self, frame: usize, out: &mut [f32; MAX_CHANNELS]) {
+        let frame_bytes = self.channels * self.encoding.bytes_per_sample();
+        let start = frame * frame_bytes;
+        let bytes = self.data.get(start..).unwrap_or_default();
+
+        match self.encoding {
+            SampleEncoding::Mulaw => {
+                for (sample, byte) in out
+                    .iter_mut()
+                    .take(self.channels)
+                    .zip(bytes.iter().take(self.channels))
+                {
+                    *sample = racf_core::decode_mulaw(*byte);
+                }
+            }
+            SampleEncoding::PcmU8 => {
+                for (sample, byte) in out
+                    .iter_mut()
+                    .take(self.channels)
+                    .zip(bytes.iter().take(self.channels))
+                {
+                    *sample = (*byte as f32 - 128.0) / 128.0;
+                }
+            }
+            SampleEncoding::PcmI16Le => {
+                for (sample, pair) in out
+                    .iter_mut()
+                    .take(self.channels)
+                    .zip(bytes.as_chunks::<2>().0.iter().take(self.channels))
+                {
+                    *sample = i16::from_le_bytes(*pair) as f32 / 32768.0;
+                }
+            }
+        }
     }
 }
 
@@ -86,21 +204,22 @@ impl SampleVoice {
             return;
         }
 
-        let frame_start = self.frame * self.clip.channels;
+        let mut samples = [0.0f32; MAX_CHANNELS];
+        self.clip.render_frame(self.frame, &mut samples);
         let channels = self.clip.channels;
 
         if channels == 1 {
-            let sample = self.clip.samples[frame_start] * self.gain;
+            let sample = samples[0] * self.gain;
             add_mono(sample, self.pan, self.channel, bus, layout);
         } else if let Some(start) = self.channel.and_then(|channel| layout.index_of(channel)) {
             // A requested role acts as the first destination; subsequent
             // source channels follow the layout order and wrap around.
-            for source in 0..channels {
+            for (source, sample) in samples.iter().take(channels).copied().enumerate() {
                 let index = (start + source) % bus.len();
-                bus[index] += self.clip.samples[frame_start + source] * self.gain;
+                bus[index] += sample * self.gain;
             }
         } else if let Some((left, right)) = layout.front_pair() {
-            for source in 0..channels {
+            for (source, sample) in samples.iter().take(channels).copied().enumerate() {
                 let index = if source == 0 {
                     left
                 } else if source == 1 {
@@ -108,12 +227,12 @@ impl SampleVoice {
                 } else {
                     source % bus.len()
                 };
-                bus[index] += self.clip.samples[frame_start + source] * self.gain;
+                bus[index] += sample * self.gain;
             }
         } else {
-            for source in 0..channels {
+            for (source, sample) in samples.iter().take(channels).copied().enumerate() {
                 let index = source % bus.len();
-                bus[index] += self.clip.samples[frame_start + source] * self.gain;
+                bus[index] += sample * self.gain;
             }
         }
 
@@ -154,61 +273,24 @@ fn add_mono(
 /// which also keeps constant signals exactly constant at the edges.
 ///
 /// Kernels are precomputed per fractional output phase (polyphase resampling)
-/// and output frames are rendered in parallel, which keeps loading large
-/// embedded clips fast.
-fn resample(input: &[f32], source_rate: f64, target_rate: f64, channels: usize) -> Vec<f32> {
-    if input.is_empty() || channels == 0 || source_rate <= 0.0 || target_rate <= 0.0 {
-        return Vec::new();
+/// and shared by every clip with the same rate pair.
+const LOBES: f32 = 4.0;
+
+/// Caches one kernel per distinct source/destination rate ratio.
+#[derive(Default)]
+pub(crate) struct ResamplerCache(HashMap<u64, Arc<PolyphaseKernel>>);
+
+impl ResamplerCache {
+    pub(crate) fn get(&mut self, source_rate: f64, target_rate: f64) -> Arc<PolyphaseKernel> {
+        let step = source_rate / target_rate;
+        self.0
+            .entry(step.to_bits())
+            .or_insert_with(|| {
+                let cutoff = if step > 1.0 { (1.0 / step) as f32 } else { 1.0 };
+                Arc::new(PolyphaseKernel::new(LOBES / cutoff, cutoff, LOBES))
+            })
+            .clone()
     }
-
-    if (source_rate - target_rate).abs() < 0.5 {
-        return input.to_vec();
-    }
-
-    let source_frames = input.len() / channels;
-    if source_frames == 0 {
-        return Vec::new();
-    }
-
-    const LOBES: f32 = 4.0;
-
-    let step = source_rate / target_rate;
-    let target_frames = ((source_frames as f64 / step).round() as usize).max(1);
-
-    // Below 1.0 this stretches the kernel and lowers its cutoff, acting as an
-    // anti-aliasing low-pass for downsampling.
-    let cutoff = if step > 1.0 { (1.0 / step) as f32 } else { 1.0 };
-    let radius = LOBES / cutoff;
-
-    let kernel = PolyphaseKernel::new(radius, cutoff, LOBES);
-    let context = ResampleContext {
-        input,
-        source_frames: source_frames as isize,
-        step,
-        channels,
-        kernel: &kernel,
-    };
-
-    let mut output = vec![0.0; target_frames * channels];
-    let workers = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1);
-
-    if workers <= 1 || target_frames < 65_536 {
-        render_frames(&context, 0, &mut output);
-        return output;
-    }
-
-    let chunk_frames = target_frames.div_ceil(workers);
-    std::thread::scope(|scope| {
-        for (index, chunk) in output.chunks_mut(chunk_frames * channels).enumerate() {
-            let context = &context;
-            let start = index * chunk_frames;
-            scope.spawn(move || render_frames(context, start, chunk));
-        }
-    });
-
-    output
 }
 
 /// Number of fractional phases in the polyphase kernel table.
@@ -220,10 +302,20 @@ const PHASES: usize = 1024;
 /// output sample falls between two source samples) changes. Building these
 /// kernels once avoids evaluating `sin` and a table lookup for every tap of
 /// every output frame.
-struct PolyphaseKernel {
+pub(crate) struct PolyphaseKernel {
     first_offset: isize,
     taps: usize,
     weights: Vec<f32>,
+}
+
+impl fmt::Debug for PolyphaseKernel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PolyphaseKernel")
+            .field("first_offset", &self.first_offset)
+            .field("taps", &self.taps)
+            .field("weights", &self.weights.len())
+            .finish()
+    }
 }
 
 impl PolyphaseKernel {
@@ -264,6 +356,7 @@ impl PolyphaseKernel {
     }
 }
 
+#[cfg(test)]
 struct ResampleContext<'a> {
     input: &'a [f32],
     source_frames: isize,
@@ -273,6 +366,7 @@ struct ResampleContext<'a> {
 }
 
 /// Renders `output` (interleaved frames starting at `start`) from the context.
+#[cfg(test)]
 fn render_frames(context: &ResampleContext<'_>, start: usize, output: &mut [f32]) {
     let channels = context.channels;
     let mut sums = vec![0.0f32; channels];
@@ -298,6 +392,54 @@ fn render_frames(context: &ResampleContext<'_>, start: usize, output: &mut [f32]
     }
 }
 
+#[cfg(test)]
+fn resample(input: &[f32], source_rate: f64, target_rate: f64, channels: usize) -> Vec<f32> {
+    if input.is_empty() || channels == 0 || source_rate <= 0.0 || target_rate <= 0.0 {
+        return Vec::new();
+    }
+
+    if (source_rate - target_rate).abs() < 0.5 {
+        return input.to_vec();
+    }
+
+    let source_frames = input.len() / channels;
+    if source_frames == 0 {
+        return Vec::new();
+    }
+
+    let step = source_rate / target_rate;
+    let target_frames = ((source_frames as f64 / step).round() as usize).max(1);
+    let kernel = ResamplerCache::default().get(source_rate, target_rate);
+    let context = ResampleContext {
+        input,
+        source_frames: source_frames as isize,
+        step,
+        channels,
+        kernel: &kernel,
+    };
+
+    let mut output = vec![0.0; target_frames * channels];
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+
+    if workers <= 1 || target_frames < 65_536 {
+        render_frames(&context, 0, &mut output);
+        return output;
+    }
+
+    let chunk_frames = target_frames.div_ceil(workers);
+    std::thread::scope(|scope| {
+        for (index, chunk) in output.chunks_mut(chunk_frames * channels).enumerate() {
+            let context = &context;
+            let start = index * chunk_frames;
+            scope.spawn(move || render_frames(context, start, chunk));
+        }
+    });
+
+    output
+}
+
 fn lanczos(x: f32, lobes: f32) -> f32 {
     if x.abs() >= lobes {
         return 0.0;
@@ -318,7 +460,6 @@ fn sinc(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use racf_core::SampleEncoding;
 
     fn clip(data: Vec<u8>, channels: u8, sample_rate: u32) -> AudioClip {
         AudioClip {
@@ -330,7 +471,7 @@ mod tests {
             sample_rate,
             channels,
             encoding: SampleEncoding::PcmI16Le,
-            data,
+            data: Arc::from(data),
         }
     }
 
@@ -383,6 +524,39 @@ mod tests {
 
         assert!((bus[0] - 0.5).abs() < 0.001);
         assert!((bus[1] + 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn streaming_prepared_clip_matches_full_resampling() {
+        let source_rate = 8_000;
+        let target_rate = 18_000;
+        let channels = 2;
+        let samples: Vec<i16> = (0..400)
+            .map(|index| ((index as f32 * 0.37).sin() * 20_000.0) as i16)
+            .collect();
+        let clip = clip(pcm16(&samples), channels as u8, source_rate);
+
+        let expected = resample(
+            &clip.decode_frames(),
+            source_rate as f64,
+            target_rate as f64,
+            channels,
+        );
+        let prepared = PreparedClip::new(&clip, target_rate as f32);
+        let mut rendered = Vec::with_capacity(expected.len());
+        let mut frame = [0.0f32; MAX_CHANNELS];
+        for index in 0..prepared.frames() {
+            prepared.render_frame(index, &mut frame);
+            rendered.extend_from_slice(&frame[..channels]);
+        }
+
+        assert_eq!(rendered.len(), expected.len());
+        for (index, (actual, expected)) in rendered.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1.0e-5,
+                "frame sample {index}: {actual} != {expected}"
+            );
+        }
     }
 
     #[test]
